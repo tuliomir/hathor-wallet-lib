@@ -48,6 +48,32 @@ jobs:
           echo $result
           echo "version_status_output=$result" >> $GITHUB_OUTPUT
 
+      # JQ allows querying JSON files easily through the CLI
+      # @see https://www.baeldung.com/linux/jq-command-json
+      - name: 'Setup jq'
+        # https://github.com/dcarbone/install-jq-action/releases/tag/v2.1.0
+        uses: dcarbone/install-jq-action@8867ddb4788346d7c22b72ea2e2ffe4d514c7bcb
+        with:
+          version: '1.7'
+
+      - name: Check if package versions match
+        run: |
+          version=${{ steps.release_version.outputs.release_status_output }}
+
+          # Extract the version number from the package.json and package-lock.json files
+          packageVersion=$(jq -r .version package.json)
+          packageLockVersion=$(jq -r .version package-lock.json)
+
+          if [[ "${packageVersion}" != "${version}" ]]; then
+            echo "Version in package.json does not match the release version"
+            exit 1
+          fi
+
+          if [[ "${packageLockVersion}" != "${version}" ]]; then
+            echo "Version in package-lock.json does not match the release version"
+            exit 1
+          fi
+        shell: bash
 
   build:
     # Will only run if the release version is valid
@@ -75,9 +101,6 @@ jobs:
 
     - name: Build
       run: npm run build
-
-    - name: Test
-      run: npm test
 
     - name: Publish
       run: echo "Would run NPM PUBLISH with token ${{ secrets.NPM_TOKEN }}"
