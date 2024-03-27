@@ -1,0 +1,85 @@
+name: Publish to npm
+
+on:
+  push:
+    branches:
+      - release
+      - release-candidate
+    tags:
+      - v*.*.*
+
+jobs:
+
+  # First check if this version is a valid public release
+  # This follows semver recommendations, with release candidates having a dash and a dot
+  # @see https://semver.org/spec/v2.0.0-rc.2.html
+  check-version:
+    runs-on: ubuntu-22.04
+    outputs:
+      release_status_output: ${{ steps.release_version.outputs.version_status_output }}
+
+    steps:
+      - name: Check release version
+        id: release_version
+        shell: bash
+        run: |
+
+          if [[ "${{ github.ref }}" = refs/tags/* ]]; then
+            version="${GITHUB_REF#refs/tags/}"
+            echo "version=$version"
+
+            # Pattern that accepts releases: "v1.0.0" , "v2.4.6".
+            if [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              result=isRelease
+            # Pattern that accepts release candidates: "v1.0.0-rc.1".
+            elif [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+              result=isReleaseCandidate
+            # Pattern that accepts "v1.0.0-rc1", an invalid rc notation.
+            elif [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc[0-9]+$ ]]; then
+              echo "release candidate version is invalid"
+              exit 1
+            else
+              result=isNotRelease
+            fi
+          else
+            result=isNotTag
+          fi
+
+          echo $result
+          echo "version_status_output=$result" >> $GITHUB_OUTPUT
+
+
+  build:
+    # Will only run if the release version is valid
+    if: >-
+      ${{
+          needs.check-version.outputs.release_status_output == 'isRelease' ||
+          needs.check-version.outputs.release_status_output == 'isReleaseCandidate'
+      }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+
+    steps:
+    # https://github.com/actions/checkout/releases/tag/v4.1.1
+    - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+
+    - name: Use Node.js
+      # https://github.com/actions/setup-node/releases/tag/v4.0.2
+      uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+      with:
+        node-version: '14.x'
+        registry-url: 'https://registry.npmjs.org'
+
+    - name: Install Dependencies
+      run: npm ci
+
+    - name: Build
+      run: npm run build
+
+    - name: Test
+      run: npm test
+
+    - name: Publish
+      run: echo "Would run NPM PUBLISH with token ${{ secrets.NPM_TOKEN }}"
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
