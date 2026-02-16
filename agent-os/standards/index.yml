@@ -1,0 +1,66 @@
+api:
+  dual-backend-architecture:
+    description: Three HTTP backends (fullnode, wallet-service, explorer, tx-mining) with incompatible patterns and error semantics
+    has_questions: true
+  error-handling:
+    description: Backend-specific error types, response checking patterns, and timeout stratification
+    has_questions: true
+  request-patterns:
+    description: Legacy callback vs modern async/await request paradigms and migration rules
+  response-validation:
+    description: Zod schema validation via axios transformResponse, BigInt preservation, and schema exposure pattern
+  swap-service:
+    description: Client-side AES encryption, custom auth header, and atomic swap HTTP utilities
+
+global:
+  config-singleton:
+    description: Dual Config/Network singletons with bidirectional sync and lazy URL resolution
+  module-organization:
+    description: Two-layer export architecture (index.ts + lib.ts), internal-only modules, and import cycle avoidance
+    has_questions: true
+  naming-conventions:
+    description: Snake_case from fullnode API, underscore prefix for private members, constant naming
+    has_questions: true
+
+models:
+  partial-transactions:
+    description: PartialTx wrapper for atomic swap signature collection with QR-code-friendly serialization
+  script-identification:
+    description: Script type detection by exact byte length and opcode sequence (P2PKH, P2SH, ScriptData)
+  serialization:
+    description: Tuple-destructuring deserialization, wire format fidelity, and signing data cache
+  token-data-bitfield:
+    description: Single-byte encoding of authority status and token index with +1 offset
+
+nano-contracts:
+  binary-encoding:
+    description: NC header wire format with mixed LEB128 and fixed-width fields, action type mapping
+  builder-pattern:
+    description: Fluent builder lifecycle, token fee handling, two-stage NC ID resolution, on-chain blueprints
+  field-type-system:
+    description: NCFieldBase interface, encoding table for all field types, composite types, and type alias parsing
+
+storage:
+  dual-backend-storage:
+    description: IStore abstraction enabling fullnode and wallet-service backends with metadata lifecycle
+  stream-sync:
+    description: StreamManager flow control, ACK backpressure, cooperative scheduling, and connection locking
+  utxo-management:
+    description: Fast vs best selection algorithms, TTL-based locking, and promise-chain concurrent unlock prevention
+
+testing:
+  integration-setup:
+    description: Docker environment, precalculated wallet pool, HTTP keep-alive workaround, and wait helpers
+    has_questions: true
+  mock-patterns:
+    description: Global mock setup, FakeHathorWallet, custom Buffer matcher, and wallet-service mock isolation
+
+typescript:
+  buffer-encoding:
+    description: Output value 4/8-byte encoding, BigInt operations, LEB128, and buffer immutability convention
+  crypto-patterns:
+    description: Bitcore-lib wrapping with Hathor overrides, PBKDF2 configuration, wallet access data encryption
+  error-hierarchy:
+    description: WalletError base class tree, domain-specific errors, error codes, and propagation patterns
+  type-patterns:
+    description: Central types.ts, OutputValueType as bigint, discriminated unions, address format, derivation paths
