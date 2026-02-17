@@ -13,3 +13,7 @@ tsconfig.tsbuildinfo
 *.leveldb*
 tmp/
 .claude/settings.local.json
+
+# Claude Code local data and scripts
+claude_data/
+claude_scripts/
