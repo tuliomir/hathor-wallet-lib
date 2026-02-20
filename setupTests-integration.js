@@ -13,9 +13,6 @@ import fs from 'fs';
 import { loggers, LoggerUtil } from './__tests__/integration/utils/logger.util';
 import config from './src/config';
 import { TX_MINING_URL, WALLET_CONSTANTS } from './__tests__/integration/configuration/test-constants';
-import {
-  precalculationHelpers, WalletPrecalculationHelper
-} from './__tests__/integration/helpers/wallet-precalculation.helper';
 import { GenesisWalletHelper } from './__tests__/integration/helpers/genesis-wallet.helper';
 import { generateWalletHelper, waitNextBlock, waitTxConfirmed } from './__tests__/integration/helpers/wallet.helper';
 import { stopGLLBackgroundTask } from './src/sync/gll';
@@ -89,10 +86,6 @@ beforeAll(async () => {
   testLogger.init({ filePrettyPrint: true });
   loggers.test = testLogger;
 
-  // Per-file setup: Loading pre-calculated wallets
-  precalculationHelpers.test = new WalletPrecalculationHelper('./tmp/wallets.json');
-  await precalculationHelpers.test.initWithWalletsFile();
-
   // One-time setup: Run only once across all test files (using shared state from CustomEnvironment)
   const sharedState = global.__SHARED_STATE__;
   if (!sharedState.setupDone) {
@@ -123,11 +116,6 @@ beforeAll(async () => {
   global.FULL_BLUEPRINT_ID = sharedState.blueprintIds.FULL_BLUEPRINT_ID;
   global.PARENT_BLUEPRINT_ID = sharedState.blueprintIds.PARENT_BLUEPRINT_ID;
   global.CHILDREN_BLUEPRINT_ID = sharedState.blueprintIds.CHILDREN_BLUEPRINT_ID;
-});
-
-afterAll(async () => {
-  // Storing data about used precalculated wallets for the next test suites
-  await precalculationHelpers.test.storeDbIntoWalletsFile();
 });
 
 expect.extend({

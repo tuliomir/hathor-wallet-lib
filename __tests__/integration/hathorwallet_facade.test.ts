@@ -1,5 +1,6 @@
 import Mnemonic from 'bitcore-mnemonic/lib/mnemonic';
-import { multisigWalletsData, precalculationHelpers } from './helpers/wallet-precalculation.helper';
+import { multisigWalletsData } from './helpers/wallet-precalculation.helper';
+import { getSimpleWallet } from './helpers/integration-test-helper-service';
 import { GenesisWalletHelper } from './helpers/genesis-wallet.helper';
 import { delay, getRandomInt } from './utils/core.util';
 import {
@@ -311,7 +312,7 @@ describe('getTxById', () => {
 
 describe('start', () => {
   it('should reject with invalid parameters', async () => {
-    const walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletData = await getSimpleWallet();
     const connection = generateConnection();
 
     /*
@@ -416,7 +417,7 @@ describe('start', () => {
   });
 
   it('should start a wallet with no history', async () => {
-    const walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletData = await getSimpleWallet();
 
     // Start the wallet
     const walletConfig = {
@@ -449,7 +450,7 @@ describe('start', () => {
 
   it('should start a wallet with a transaction history', async () => {
     // Send a transaction to one of the wallet's addresses
-    const walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletData = await getSimpleWallet();
 
     // We are not using the injectFunds helper method here because
     // we want to send this transaction before the wallet is started
@@ -482,7 +483,7 @@ describe('start', () => {
   });
 
   it("should calculate the wallet's addresses on start", async () => {
-    const walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletData = await getSimpleWallet();
 
     // Start the wallet
     const walletConfig = {
@@ -546,7 +547,7 @@ describe('start', () => {
   });
 
   it('should start a wallet to manage a specific token', async () => {
-    const walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletData = await getSimpleWallet();
 
     // Creating a new wallet with a known set of words just to generate the custom token
     let hWallet = await generateWalletHelper({
@@ -619,7 +620,7 @@ describe('start', () => {
   });
 
   it('should start a wallet via xpub', async () => {
-    const walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletData = await getSimpleWallet();
     const code = new Mnemonic(walletData.words);
     const rootXpriv = code.toHDPrivateKey('', new Network('testnet'));
     const xpriv = rootXpriv.deriveNonCompliantChild(P2PKH_ACCT_PATH);
@@ -684,7 +685,7 @@ describe('start', () => {
   });
 
   it('should start an externally signed wallet', async () => {
-    const walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletData = await getSimpleWallet();
     const code = new Mnemonic(walletData.words);
     const rootXpriv = code.toHDPrivateKey('', new Network('privatenet'));
     const xpriv = rootXpriv.deriveNonCompliantChild(P2PKH_ACCT_PATH);
@@ -704,7 +705,7 @@ describe('start', () => {
   });
 
   it('should start an externally signed wallet from storage', async () => {
-    const walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletData = await getSimpleWallet();
     const code = new Mnemonic(walletData.words);
     const rootXpriv = code.toHDPrivateKey('', new Network('privatenet'));
     const xpriv = rootXpriv.deriveNonCompliantChild(P2PKH_ACCT_PATH);
@@ -728,7 +729,7 @@ describe('start', () => {
 
   it('should start a wallet without pin', async () => {
     // Generating the wallet
-    const walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletData = await getSimpleWallet();
     const hWallet = await generateWalletHelper({
       seed: walletData.words,
       preCalculatedAddresses: walletData.addresses,

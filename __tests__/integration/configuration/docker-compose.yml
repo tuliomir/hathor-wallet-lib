@@ -39,6 +39,25 @@ services:
       timeout: 10s
       retries: 10
 
+  hathor-test-helper:
+    image: hathor-integration-test-helper:latest
+    ports:
+      - "3020:3020"
+    environment:
+      GENESIS_SEED_WORDS: "avocado spot town typical traffic vault danger century property shallow divorce festival spend attack anchor afford rotate green audit adjust fade wagon depart level"
+      HATHOR_NODE_URL: http://fullnode:8080/v1a/
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://localhost:3020/status').then(r=>r.json()).then(s=>{if(!s.ready)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      start_period: 60s
+      retries: 20
+    depends_on:
+      fullnode:
+        condition: service_healthy
+    networks:
+      - hathor-privnet
+
   tx-mining-service:
     platform: linux/amd64
     image:
@@ -60,7 +79,7 @@ services:
   cpuminer:
     image: hathornetwork/cpuminer
     depends_on:
-      - tx-mining-service
+      - ws-serverless // Only start mining after the whole infra is up
     command: [
       "-a", "sha256d",
       "--coinbase-addr", "WTjhJXzQJETVx7BVXdyZmvk396DRRsubdw", # Refer to test-utils-integration.js, WALLET_CONSTANTS

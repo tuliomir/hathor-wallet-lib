@@ -16,7 +16,8 @@ import {
 } from '../configuration/test-constants';
 import HathorWallet from '../../../src/new/wallet';
 import walletUtils from '../../../src/utils/wallet';
-import { multisigWalletsData, precalculationHelpers } from './wallet-precalculation.helper';
+import { multisigWalletsData } from './wallet-precalculation.helper';
+import { getSimpleWallet } from './integration-test-helper-service';
 import { delay } from '../utils/core.util';
 import { loggers } from '../utils/logger.util';
 import { MemoryStore, Storage } from '../../../src/storage';
@@ -86,9 +87,9 @@ export async function generateWalletHelper(param) {
   /** @type PrecalculatedWalletData */
   let walletData = {};
 
-  // Only fetch a precalculated wallet if the input does not offer a specific one
+  // Only fetch a wallet from the test helper service if the input does not offer a specific one
   if (!param) {
-    walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    walletData = await getSimpleWallet();
   } else {
     walletData.words = param.seed;
     walletData.addresses = param.preCalculatedAddresses;
@@ -133,9 +134,9 @@ export async function generateWalletHelperRO(options) {
   let walletData = {};
   /** @type string */
   let xpub;
-  // Only fetch a precalculated wallet if the input does not offer a specific one
+  // Only fetch a wallet from the test helper service if the input does not offer a specific one
   if (!options.xpub) {
-    walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    walletData = await getSimpleWallet();
     xpub = walletUtils.getXPubKeyFromSeed(walletData.words, { networkName: 'testnet' });
   } else {
     walletData.addresses = options.preCalculatedAddresses;

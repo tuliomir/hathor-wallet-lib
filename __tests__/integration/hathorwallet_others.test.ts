@@ -17,7 +17,7 @@ import {
 } from './configuration/test-constants';
 import dateFormatter from '../../src/utils/date';
 import { AddressError } from '../../src/errors';
-import { precalculationHelpers } from './helpers/wallet-precalculation.helper';
+import { getSimpleWallet } from './helpers/integration-test-helper-service';
 import { ConnectionState } from '../../src/wallet/types';
 import HathorWallet from '../../src/new/wallet';
 import { MemoryStore } from '../../src/storage';
@@ -1709,7 +1709,7 @@ describe('index-limit address scanning policy', () => {
   /** @type HathorWallet */
   let hWallet;
   beforeAll(async () => {
-    const walletData = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletData = await getSimpleWallet();
     hWallet = await generateWalletHelper({
       seed: walletData.words,
       addresses: walletData.addresses,

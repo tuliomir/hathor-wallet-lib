@@ -1,5 +1,5 @@
 import { GenesisWalletHelper } from '../helpers/genesis-wallet.helper';
-import { precalculationHelpers } from '../helpers/wallet-precalculation.helper';
+import { getSimpleWallet } from '../helpers/integration-test-helper-service';
 import {
   DEFAULT_PIN_CODE,
   DEFAULT_PASSWORD,
@@ -99,7 +99,7 @@ describe('locked utxos', () => {
 
   it('should unselect as input when spent', async () => {
     // memory store
-    const walletDataMem = precalculationHelpers.test.getPrecalculatedWallet();
+    const walletDataMem = await getSimpleWallet();
     const storeMem = new MemoryStore();
     const storageMem = new Storage(storeMem);
     await testUnlockWhenSpent(storageMem, walletDataMem);
