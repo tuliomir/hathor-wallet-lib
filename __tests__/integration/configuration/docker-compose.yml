@@ -8,12 +8,13 @@ services:
 
   fullnode:
     image:
-      ${HATHOR_LIB_INTEGRATION_TESTS_FULLNODE_IMAGE:-hathornetwork/hathor-core:experimental-push_fee_header}
+      hathor-core:test-mode-block-weight
     command: [
       "run_node",
       "--listen", "tcp:40404",
       "--status", "8080",
       "--test-mode-tx-weight",
+      "--test-mode-block-weight",
       "--wallet-index",
       "--allow-mining-without-peers",
       "--unsafe-mode", "nano-testnet-bravo",
@@ -46,6 +47,10 @@ services:
     environment:
       GENESIS_SEED_WORDS: "avocado spot town typical traffic vault danger century property shallow divorce festival spend attack anchor afford rotate green audit adjust fade wagon depart level"
       HATHOR_NODE_URL: http://fullnode:8080/v1a/
+      TX_MINING_URL: http://tx-mining-service:8035/
+      TX_MIN_WEIGHT: "1"
+      UTXO_SPLIT_COUNT: "100"
+      REFILL_THRESHOLD: "10"
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://localhost:3020/status').then(r=>r.json()).then(s=>{if(!s.ready)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 5s
@@ -61,7 +66,7 @@ services:
   tx-mining-service:
     platform: linux/amd64
     image:
-      ${HATHOR_LIB_INTEGRATION_TESTS_TXMINING_IMAGE:-hathornetwork/tx-mining-service}
+      tx-mining-service:latest
     depends_on:
       fullnode:
         condition: service_healthy
@@ -71,25 +76,14 @@ services:
     command: [
       "http://fullnode:8080",
       "--stratum-port=8034",
-      "--api-port=8035"
+      "--block-interval=1000",
+      "--api-port=8035",
+      "--dev-miner",
+      "--testnet",
+      "--address", "WTjhJXzQJETVx7BVXdyZmvk396DRRsubdw",
     ]
     networks:
       - hathor-privnet
-
-  cpuminer:
-    image: hathornetwork/cpuminer
-    depends_on:
-      - ws-serverless // Only start mining after the whole infra is up
-    command: [
-      "-a", "sha256d",
-      "--coinbase-addr", "WTjhJXzQJETVx7BVXdyZmvk396DRRsubdw", # Refer to test-utils-integration.js, WALLET_CONSTANTS
-      "-o", "stratum+tcp://tx-mining-service:8034",
-      "--retry-pause", "5", # 5 seconds between retries
-      "-t", "1" # Number of threads used to mine
-    ]
-    networks:
-      - hathor-privnet
-
 
   # Wallet Service section
   # All the following services are related to the Wallet Service

@@ -17,7 +17,7 @@ import {
 } from './configuration/test-constants';
 import dateFormatter from '../../src/utils/date';
 import { AddressError } from '../../src/errors';
-import { getSimpleWallet } from './helpers/integration-test-helper-service';
+import { fundAddress, getSimpleWallet } from './helpers/integration-test-helper-service';
 import { ConnectionState } from '../../src/wallet/types';
 import HathorWallet from '../../src/new/wallet';
 import { MemoryStore } from '../../src/storage';
@@ -67,7 +67,7 @@ describe('processing transaction metadata changes', () => {
     ]);
     expect(store.utxos.size).toStrictEqual(0);
 
-    const injectedTx = await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    const injectedTx = await fundAddress(hWallet, addr0, 10n);
     if (!injectedTx.hash) {
       throw new Error('Could not inject funds into wallet');
     }
@@ -134,7 +134,7 @@ describe('processing transaction metadata changes', () => {
     ]);
     expect(store.utxos.size).toStrictEqual(0);
 
-    const injectedTx = await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    const injectedTx = await fundAddress(hWallet, addr0, 10n);
     if (!injectedTx.hash) {
       throw new Error('Could not inject funds into wallet');
     }
@@ -251,7 +251,7 @@ describe('processing transaction metadata changes', () => {
     ]);
     expect(store.utxos.size).toStrictEqual(0);
 
-    const injectedTx = await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    const injectedTx = await fundAddress(hWallet, addr0, 10n);
     if (!injectedTx.hash) {
       throw new Error('Could not inject funds into wallet');
     }
@@ -361,7 +361,7 @@ describe('processing transaction metadata changes', () => {
     ]);
     expect(store.utxos.size).toStrictEqual(0);
 
-    const injectedTx = await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    const injectedTx = await fundAddress(hWallet, addr0, 10n);
     if (!injectedTx.hash) {
       throw new Error('Could not inject funds into wallet');
     }
@@ -502,7 +502,7 @@ describe('getAddressInfo', () => {
     });
 
     // Validating address after 1 transaction
-    await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    await fundAddress(hWallet, addr0, 10n);
     await expect(hWallet.getAddressInfo(addr0)).resolves.toMatchObject({
       total_amount_received: 10n,
       total_amount_sent: 0n,
@@ -614,7 +614,7 @@ describe('getAddressInfo', () => {
     const addr1Custom = await hWalletCustom.getAddressAtIndex(1);
 
     // Creating custom token
-    await GenesisWalletHelper.injectFunds(hWalletCustom, addr0Custom, 1n);
+    await fundAddress(hWalletCustom, addr0Custom, 1n);
     const { hash: tokenUid } = await createTokenHelper(
       hWalletCustom,
       'getAddressInfo Token',
@@ -740,11 +740,7 @@ describe('getAvailableUtxos', () => {
     expect(utxoGenResult).toStrictEqual({ done: true, value: undefined });
 
     // Inject a transaction and validate the results
-    const tx1 = await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(0),
-      10n
-    );
+    const tx1 = await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     // Get correct results for a single transaction
     utxoGenerator = await hWallet.getAvailableUtxos();
@@ -774,16 +770,8 @@ describe('getAvailableUtxos', () => {
      * @type HathorWallet
      */
     const hWallet = await generateWalletHelper();
-    const tx1 = await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(0),
-      10n
-    );
-    const tx2 = await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(1),
-      5n
-    );
+    const tx1 = await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    const tx2 = await fundAddress(hWallet, await hWallet.getAddressAtIndex(1), 5n);
 
     // Validate that on the address that received tx1, the UTXO is listed
     let utxoGenerator = await hWallet.getAvailableUtxos({
@@ -819,7 +807,7 @@ describe('getAvailableUtxos', () => {
      * @type HathorWallet
      */
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(
       hWallet,
       'getAvailableUtxos Token',
@@ -912,7 +900,7 @@ describe('getUtxosForAmount', () => {
   it('should work on a wallet containing a single tx', async () => {
     const addr0 = await hWallet.getAddressAtIndex(0);
     const addr1 = await hWallet.getAddressAtIndex(1);
-    const tx1 = await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    const tx1 = await fundAddress(hWallet, addr0, 10n);
     fundTx1hash = tx1.hash;
 
     // No change amount
@@ -963,7 +951,7 @@ describe('getUtxosForAmount', () => {
   it('should work on a wallet containing multiple txs', async () => {
     const addr0 = await hWallet.getAddressAtIndex(0);
     const addr1 = await hWallet.getAddressAtIndex(1);
-    const tx2 = await GenesisWalletHelper.injectFunds(hWallet, addr1, 20n);
+    const tx2 = await fundAddress(hWallet, addr1, 20n);
 
     /*
      * Since we don't know which order the transactions will be stored on the history,
@@ -1083,7 +1071,7 @@ describe('getUtxosForAmount', () => {
   it('should not retrieve utxos marked as selected', async () => {
     // Retrieving the utxo's data and marking it as selected
     const addr = await hWallet.getAddressAtIndex(11);
-    await GenesisWalletHelper.injectFunds(hWallet, addr, 100n);
+    await fundAddress(hWallet, addr, 100n);
 
     const utxosAddr1 = await hWallet.getUtxos({ filter_address: addr });
     const singleUtxoAddr1 = utxosAddr1.utxos[0];
@@ -1112,7 +1100,7 @@ describe('consolidateUtxos', () => {
   beforeAll(async () => {
     hWallet1 = await generateWalletHelper();
     hWallet2 = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet2, await hWallet2.getAddressAtIndex(0), 110n);
+    await fundAddress(hWallet2, await hWallet2.getAddressAtIndex(0), 110n);
     const { hash: tokenUid } = await createTokenHelper(
       hWallet2,
       'Consolidate Token',
@@ -1519,7 +1507,7 @@ describe('getAuthorityUtxos', () => {
 
   it('should find one authority utxo', async () => {
     // Creating the token
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 1n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 1n);
     const { hash: tokenUid } = await createTokenHelper(
       hWallet,
       'getAuthorityUtxos Token',
@@ -1697,7 +1685,7 @@ describe('internal methods', () => {
   });
 
   it('should reload the storage', async () => {
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const spy = jest.spyOn(hWallet.storage, 'processHistory');
     // Simulate that we received an event of the connection becoming active
     await hWallet.onConnectionChangedState(ConnectionState.CONNECTED);

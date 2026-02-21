@@ -13,11 +13,19 @@ import fs from 'fs';
 import { loggers, LoggerUtil } from './__tests__/integration/utils/logger.util';
 import config from './src/config';
 import { TX_MINING_URL, WALLET_CONSTANTS } from './__tests__/integration/configuration/test-constants';
+import { TX_WEIGHT_CONSTANTS } from './src/constants';
 import { GenesisWalletHelper } from './__tests__/integration/helpers/genesis-wallet.helper';
 import { generateWalletHelper, waitNextBlock, waitTxConfirmed } from './__tests__/integration/helpers/wallet.helper';
 import { stopGLLBackgroundTask } from './src/sync/gll';
+import { fundAddress } from './__tests__/integration/helpers/integration-test-helper-service';
 
 config.setTxMiningUrl(TX_MINING_URL);
+
+// Align weight constants with the privnet fullnode config (privnet.yml)
+// so that calculateWeight() produces minimal weights for faster mining.
+TX_WEIGHT_CONSTANTS.txMinWeight = 1;
+TX_WEIGHT_CONSTANTS.txMinWeightK = 0;
+TX_WEIGHT_CONSTANTS.txWeightCoefficient = 0;
 
 
 /**
@@ -40,7 +48,7 @@ async function createOCBs(sharedState) {
   const { seed } = WALLET_CONSTANTS.ocb;
   const ocbWallet = await generateWalletHelper({ seed });
   const address0 = await ocbWallet.getAddressAtIndex(0);
-  await GenesisWalletHelper.injectFunds(ocbWallet, address0, 1000n);
+  await fundAddress(ocbWallet, address0, 1000n);
 
   const codeBet = fs.readFileSync('./__tests__/integration/configuration/blueprints/bet.py', 'utf8');
   const txBet = await ocbWallet.createAndSendOnChainBlueprintTransaction(codeBet, address0);

@@ -1,6 +1,6 @@
 import Mnemonic from 'bitcore-mnemonic/lib/mnemonic';
 import { multisigWalletsData } from './helpers/wallet-precalculation.helper';
-import { getSimpleWallet } from './helpers/integration-test-helper-service';
+import { fundAddress, getSimpleWallet } from './helpers/integration-test-helper-service';
 import { GenesisWalletHelper } from './helpers/genesis-wallet.helper';
 import { delay, getRandomInt } from './utils/core.util';
 import {
@@ -55,7 +55,7 @@ describe('template methods', () => {
     const hWallet = await generateWalletHelper();
     const address = await hWallet.getAddressAtIndex(1);
 
-    await GenesisWalletHelper.injectFunds(hWallet, address, 10n);
+    await fundAddress(hWallet, address, 10n);
 
     const template = new TransactionTemplateBuilder()
       .addConfigAction({ createToken: true, tokenName: 'Tmpl Token', tokenSymbol: 'TT' })
@@ -82,7 +82,7 @@ describe('template methods', () => {
     const hWallet = await generateWalletHelper();
     const address = await hWallet.getAddressAtIndex(1);
 
-    await GenesisWalletHelper.injectFunds(hWallet, address, 10n);
+    await fundAddress(hWallet, address, 10n);
 
     const template = new TransactionTemplateBuilder()
       .addConfigAction({ createToken: true, tokenName: 'Tmpl Token', tokenSymbol: 'TT' })
@@ -124,7 +124,7 @@ describe('getWalletInputInfo', () => {
     const address = await hWallet.getAddressAtIndex(1);
 
     const network = hWallet.getNetworkObject();
-    await GenesisWalletHelper.injectFunds(hWallet, address, 10n);
+    await fundAddress(hWallet, address, 10n);
 
     const sendTransaction = new SendTransaction({
       storage: hWallet.storage,
@@ -164,7 +164,7 @@ describe('getTxById', () => {
 
     // Injecting some funds on this wallet
     const fundDestinationAddress = await hWallet.getAddressAtIndex(0);
-    const tx1 = await GenesisWalletHelper.injectFunds(hWallet, fundDestinationAddress, 10n);
+    const tx1 = await fundAddress(hWallet, fundDestinationAddress, 10n);
     // Validating the full history increased in one
     expect(Object.keys(await hWallet.getFullHistory())).toHaveLength(1);
 
@@ -255,7 +255,7 @@ describe('getTxById', () => {
     // Test case: custom token with funds
     const address = await hWallet.getAddressAtIndex(0);
     // Inject 10 HTR into the wallet
-    await GenesisWalletHelper.injectFunds(hWallet, address, 10n);
+    await fundAddress(hWallet, address, 10n);
     // Generate a random amount of new tokens
     const newTokenAmount = BigInt(getRandomInt(1000, 10));
     // Create a new custom token with the generated amount
@@ -452,10 +452,11 @@ describe('start', () => {
     // Send a transaction to one of the wallet's addresses
     const walletData = await getSimpleWallet();
 
-    // We are not using the injectFunds helper method here because
+    // FIXME: Use the FundAddress here too. Refactor the method to allow this edge case.
+    // We are not using the fundAddress helper method here because
     // we want to send this transaction before the wallet is started
     // then we don't have the wallet object, which is an expected parameter
-    // for the injectFunds method now
+    // for the fundAddress method now
     // Since we start and load the wallet after the transaction is sent to the full node
     // we don't need to worry for it to be received in the websocket
     const injectAddress = walletData.addresses[0];
@@ -554,7 +555,7 @@ describe('start', () => {
       seed: walletData.words,
       preCalculatedAddresses: walletData.addresses,
     });
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 2n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 2n);
     const { hash: tokenUid } = await createTokenHelper(
       hWallet,
       'Dedicated Wallet Token',
@@ -672,7 +673,7 @@ describe('start', () => {
     await expect(hWallet.getUtxos()).resolves.toHaveProperty('total_utxos_available', 0n);
 
     // Generating a transaction and validating it shows correctly
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(1), 1n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(1), 1n);
 
     await expect(hWallet.getBalance(NATIVE_TOKEN_UID)).resolves.toMatchObject([
       expect.objectContaining({
@@ -737,7 +738,7 @@ describe('start', () => {
     });
 
     // Adding funds to it
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     /*
      * XXX: The code branches that require a PIN would not be achievable without this hack that
@@ -848,7 +849,7 @@ describe('addresses methods', () => {
 
     // Expect the "current address" to change when a transaction arrives at the current one
     currentAddress = await hWallet.getCurrentAddress();
-    await GenesisWalletHelper.injectFunds(hWallet, currentAddress.address, 1n);
+    await fundAddress(hWallet, currentAddress.address, 1n);
     const currentAfterTx = await hWallet.getCurrentAddress();
     expect(currentAfterTx).toMatchObject({
       index: currentAddress.index + 1,
@@ -948,11 +949,7 @@ describe('getBalance', () => {
 
     // Generating one transaction to validate its effects
     const injectedValue = BigInt(getRandomInt(10, 2));
-    await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(0),
-      injectedValue
-    );
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), injectedValue);
 
     // Validating the transaction effects
     const balance1 = await hWallet.getBalance(NATIVE_TOKEN_UID);
@@ -982,7 +979,7 @@ describe('getBalance', () => {
     });
 
     // Creating a new custom token
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const newTokenAmount = BigInt(getRandomInt(1000, 10));
     const { hash: tokenUid } = await createTokenHelper(
       hWallet,
@@ -1024,11 +1021,7 @@ describe('getFullHistory', () => {
 
     // Injecting some funds on this wallet
     const fundDestinationAddress = await hWallet.getAddressAtIndex(0);
-    const { hash: fundTxId } = await GenesisWalletHelper.injectFunds(
-      hWallet,
-      fundDestinationAddress,
-      10n
-    );
+    const { hash: fundTxId } = await fundAddress(hWallet, fundDestinationAddress, 10n);
 
     // Validating the full history increased in one
     await expect(hWallet.storage.store.historyCount()).resolves.toEqual(1);
@@ -1103,7 +1096,7 @@ describe('getFullHistory', () => {
 
   it('should return full history (custom token)', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const tokenName = 'Full History Token';
     const tokenSymbol = 'FHT';
     const { hash: tokenUid } = await createTokenHelper(hWallet, tokenName, tokenSymbol, 100n);
@@ -1168,11 +1161,7 @@ describe('getTxBalance', () => {
 
   it('should get tx balance', async () => {
     const hWallet = await generateWalletHelper();
-    const { hash: tx1Hash } = await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(0),
-      10n
-    );
+    const { hash: tx1Hash } = await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     // Validating tx balance for a transaction with a single token (htr)
     const tx1 = await hWallet.getTx(tx1Hash);
@@ -1253,11 +1242,7 @@ describe('getFullTxById', () => {
   it('should download an existing transaction from the fullnode', async () => {
     const hWallet = await generateWalletHelper();
 
-    const tx1 = await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(0),
-      10n
-    );
+    const tx1 = await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     const fullTx = await hWallet.getFullTxById(tx1.hash);
     expect(fullTx.success).toStrictEqual(true);
@@ -1297,11 +1282,7 @@ describe('getTxConfirmationData', () => {
   it('should download confirmation data for an existing transaction from the fullnode', async () => {
     const hWallet = await generateWalletHelper();
 
-    const tx1 = await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(0),
-      10n
-    );
+    const tx1 = await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     const confirmationData = await hWallet.getTxConfirmationData(tx1.hash);
 
@@ -1343,11 +1324,7 @@ describe('graphvizNeighborsQuery', () => {
 
   it('should download graphviz neighbors data for a existing transaction from the fullnode', async () => {
     const hWallet = await generateWalletHelper();
-    const tx1 = await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(0),
-      10n
-    );
+    const tx1 = await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const neighborsData = await hWallet.graphvizNeighborsQuery(tx1.hash, 'funds', 1);
 
     expect(neighborsData).toMatch(/digraph {/);
@@ -1355,11 +1332,7 @@ describe('graphvizNeighborsQuery', () => {
 
   it('should capture errors when graphviz returns error', async () => {
     const hWallet = await generateWalletHelper();
-    const tx1 = await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(0),
-      10n
-    );
+    const tx1 = await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     await expect(hWallet.graphvizNeighborsQuery(tx1.hash)).rejects.toThrow(
       'Request failed with status code 500'
@@ -1404,7 +1377,7 @@ describe('sendTransaction', () => {
 
   it('should send HTR transactions', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     // Sending a transaction inside the same wallet
     const tx1 = await hWallet.sendTransaction(await hWallet.getAddressAtIndex(2), 6n);
@@ -1490,7 +1463,7 @@ describe('sendTransaction', () => {
 
   it('should send custom token transactions', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(hWallet, 'Token to Send', 'TTS', 100n);
 
     const tx1 = await hWallet.sendTransaction(await hWallet.getAddressAtIndex(5), 30n, {
@@ -1544,7 +1517,7 @@ describe('sendTransaction', () => {
   });
   it('should send custom fee token transactions', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(hWallet, 'FeeBasedToken', 'FBT', 8582n, {
       tokenVersion: TokenVersion.FEE,
     });
@@ -1606,7 +1579,7 @@ describe('sendTransaction', () => {
 
   it('should send fee token with manually provided HTR input (no HTR output)', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(
       hWallet,
       'FeeTokenManualInput',
@@ -1670,7 +1643,7 @@ describe('sendTransaction', () => {
     const mhWallet1 = await generateMultisigWalletHelper({ walletIndex: 0 });
     const mhWallet2 = await generateMultisigWalletHelper({ walletIndex: 1 });
     const mhWallet3 = await generateMultisigWalletHelper({ walletIndex: 2 });
-    await GenesisWalletHelper.injectFunds(mhWallet1, await mhWallet1.getAddressAtIndex(0), 10n);
+    await fundAddress(mhWallet1, await mhWallet1.getAddressAtIndex(0), 10n);
 
     /*
      * Building tx proposal:
@@ -1753,7 +1726,7 @@ describe('sendManyOutputsTransaction', () => {
 
   it('should send simple HTR transactions', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 100n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 100n);
 
     // Single input and single output
     const rawSimpleTx = await hWallet.sendManyOutputsTransaction([
@@ -1828,7 +1801,7 @@ describe('sendManyOutputsTransaction', () => {
 
   it('should send transactions with multiple tokens', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(hWallet, 'Multiple Tokens Tk', 'MTTK', 200n);
 
     // Generating tx
@@ -1894,7 +1867,7 @@ describe('sendManyOutputsTransaction', () => {
 
   it('should respect timelocks', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     // Defining timelocks (milliseconds) and timestamps (seconds)
     const startTime = Date.now().valueOf();
@@ -1976,7 +1949,7 @@ describe('authority utxo selection', () => {
   it('getMintAuthority', async () => {
     // Setting up the custom token
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 1n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 1n);
     const { hash: tokenUid } = await createTokenHelper(hWallet, 'Token to test', 'ATST', 100n);
 
     // Mark mint authority as selected_as_input
@@ -2000,7 +1973,7 @@ describe('authority utxo selection', () => {
   it('getMeltAuthority', async () => {
     // Setting up the custom token
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 1n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 1n);
     const { hash: tokenUid } = await createTokenHelper(hWallet, 'Token to test', 'ATST', 100n);
 
     // Mark melt authority as selected_as_input
@@ -2032,7 +2005,7 @@ describe('createNewToken', () => {
     // Creating the wallet with the funds
     const hWallet = await generateWalletHelper();
     const addr0 = await hWallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    await fundAddress(hWallet, addr0, 10n);
 
     // Creating the new token
     const newTokenResponse = await hWallet.createNewToken('TokenName', 'TKN', 100n);
@@ -2057,7 +2030,7 @@ describe('createNewToken', () => {
     // Creating the wallet with the funds
     const hWallet = await generateWalletHelper();
     const addr0 = await hWallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    await fundAddress(hWallet, addr0, 10n);
 
     // Creating the new token
     const newTokenResponse = await hWallet.createNewToken('TokenName', 'TKN', 8582n, {
@@ -2086,7 +2059,7 @@ describe('createNewToken', () => {
     // Creating the wallet with the funds
     const hWallet = await generateWalletHelper();
     const addr0 = await hWallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    await fundAddress(hWallet, addr0, 10n);
 
     // Creating the new token
     const destinationAddress = await hWallet.getAddressAtIndex(4);
@@ -2122,7 +2095,7 @@ describe('createNewToken', () => {
     // Creating the wallet with the funds
     const hWallet = await generateWalletHelper();
     const addr0 = await hWallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hWallet, addr0, 2n);
+    await fundAddress(hWallet, addr0, 2n);
 
     // Creating the new token
     const dbtResponse = await hWallet.createNewToken('Immutable Token', 'ITKN', 100n, {
@@ -2152,7 +2125,7 @@ describe('createNewToken', () => {
     const addr0 = await hWallet.getAddressAtIndex(0);
     const addr10 = await hWallet.getAddressAtIndex(10);
     const addr11 = await hWallet.getAddressAtIndex(11);
-    await GenesisWalletHelper.injectFunds(hWallet, addr0, 2n);
+    await fundAddress(hWallet, addr0, 2n);
 
     // Creating the new token
     const dbtResponse = await hWallet.createNewToken('New Token', 'NTKN', 100n, {
@@ -2212,7 +2185,7 @@ describe('createNewToken', () => {
     const addr0 = await hWallet.getAddressAtIndex(0);
     const addr2_0 = await hWallet2.getAddressAtIndex(0);
     const addr2_1 = await hWallet2.getAddressAtIndex(1);
-    await GenesisWalletHelper.injectFunds(hWallet, addr0, 1n);
+    await fundAddress(hWallet, addr0, 1n);
 
     // Error creating token with external address
     await expect(
@@ -2275,7 +2248,7 @@ describe('mintTokens', () => {
   it('should mint new tokens', async () => {
     // Setting up the custom token
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 2n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 2n);
     const { hash: tokenUid } = await createTokenHelper(hWallet, 'Token to Mint', 'TMINT', 100n);
     const options = { tokenVersion: TokenVersion.FEE };
     const { hash: fbtUid } = await createTokenHelper(
@@ -2295,7 +2268,7 @@ describe('mintTokens', () => {
       /^Not enough HTR tokens for deposit or fee: 1 required, \d+ available$/
     );
 
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 9n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 9n);
 
     // Minting more of the tokens
     const mintAmount = BigInt(getRandomInt(100, 50));
@@ -2448,7 +2421,7 @@ describe('mintTokens', () => {
 
     // Setting up scenario
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 13n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 13n);
     const { hash: tokenUid } = await createTokenHelper(hWallet, 'Token to Mint', 'TMINT', 100n);
     const { hash: fbtUid } = await createTokenHelper(hWallet, 'FeeBasedToken', 'FBT', 8582n, {
       tokenVersion: TokenVersion.FEE,
@@ -2557,7 +2530,7 @@ describe('meltTokens', () => {
 
   it('should melt tokens', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 15n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 15n);
 
     // Creating the token
     const { hash: tokenUid } = await createTokenHelper(hWallet, 'Token to Melt', 'TMELT', 500n);
@@ -2679,11 +2652,7 @@ describe('meltTokens', () => {
   it('should melt fee based tokens', async () => {
     const hWallet = await generateWalletHelper();
     let expectedHtrAmount = 15n;
-    await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(0),
-      expectedHtrAmount
-    );
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), expectedHtrAmount);
 
     // Creating the token
     const { hash: fbtUid } = await createTokenHelper(hWallet, 'FeeBasedToken', 'FBT', 8582n, {
@@ -2864,7 +2833,7 @@ describe('meltTokens', () => {
 
     // Setting up scenario
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 20n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 20n);
     const { hash: tokenUid } = await createTokenHelper(hWallet, 'Token to Melt', 'TMELT', 1900n);
     let expectedHtrFunds = 1n;
 
@@ -2925,7 +2894,7 @@ describe('delegateAuthority', () => {
 
   it('should delegate authority between wallets', async () => {
     // Creating a Custom Token on wallet 1
-    await GenesisWalletHelper.injectFunds(hWallet1, await hWallet1.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet1, await hWallet1.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(hWallet1, 'Delegate Token', 'DTK', 100n);
 
     // Should handle trying to delegate without the authority
@@ -2985,7 +2954,7 @@ describe('delegateAuthority', () => {
 
   it('should delegate authority to another wallet without keeping one', async () => {
     // Creating a Custom Token on wallet 1
-    await GenesisWalletHelper.injectFunds(hWallet1, await hWallet1.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet1, await hWallet1.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(hWallet1, 'Delegate Token', 'DTK', 100n);
 
     // Delegate mint authority without keeping one on wallet 1
@@ -3004,7 +2973,7 @@ describe('delegateAuthority', () => {
     // TODO: The type of errors on mint and melt are different. They should have a standard.
 
     // Validating success on mint tokens from Wallet 2
-    await GenesisWalletHelper.injectFunds(hWallet2, await hWallet2.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet2, await hWallet2.getAddressAtIndex(0), 10n);
     const mintTxWallet2 = await hWallet2.mintTokens(tokenUid, 100n);
     expect(mintTxWallet2).toHaveProperty('hash');
     await waitForTxReceived(hWallet2, mintTxWallet2.hash);
@@ -3029,7 +2998,7 @@ describe('delegateAuthority', () => {
 
   it('should delegate mint authority to another wallet while keeping one', async () => {
     // Creating a Custom Token on wallet 1
-    await GenesisWalletHelper.injectFunds(hWallet1, await hWallet1.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet1, await hWallet1.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(hWallet1, 'Delegate Token 2', 'DTK2', 100n);
 
     // Creating another mint authority token on the same wallet
@@ -3093,7 +3062,7 @@ describe('delegateAuthority', () => {
 
   it('should delegate melt authority to another wallet while keeping one', async () => {
     // Creating a Custom Token on wallet 1
-    await GenesisWalletHelper.injectFunds(hWallet1, await hWallet1.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet1, await hWallet1.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(hWallet1, 'Delegate Token 2', 'DTK2', 100n);
 
     // Creating another melt authority token on the same wallet
@@ -3164,7 +3133,7 @@ describe('destroyAuthority', () => {
 
   it('should destroy mint authorities', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(
       hWallet,
       'Token for MintDestroy',
@@ -3208,7 +3177,7 @@ describe('destroyAuthority', () => {
 
   it('should destroy melt authorities', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const { hash: tokenUid } = await createTokenHelper(
       hWallet,
       'Token for MeltDestroy',
@@ -3258,7 +3227,7 @@ describe('create token with data outputs', () => {
 
   it('should create a token with data outputs', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     const tx = await createTokenHelper(hWallet, 'Token with data outputs', 'DOUT', 100n, {
       data: ['test1', 'test2'],
     });
@@ -3290,7 +3259,7 @@ describe('createNFT', () => {
 
   it('should create an NFT with mint/melt authorities', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     // Creating one NFT with default authorities
     const nftTx = await hWallet.createNFT('New NFT', 'NNFT', 1n, sampleNftData, {
@@ -3347,7 +3316,7 @@ describe('createNFT', () => {
 
   it('should create an NFT without authorities', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     // Creating one NFT without authorities, and with a specific destination address
     const nftTx = await hWallet.createNFT('New NFT 2', 'NNFT2', 1n, sampleNftData, {
@@ -3375,7 +3344,7 @@ describe('createNFT', () => {
     const addr0 = await hWallet.getAddressAtIndex(0);
     const addr10 = await hWallet.getAddressAtIndex(10);
     const addr11 = await hWallet.getAddressAtIndex(11);
-    await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    await fundAddress(hWallet, addr0, 10n);
 
     // Creating the new token
     const newTokenResponse = await hWallet.createNFT('New Token', 'NTKN', 100n, sampleNftData, {
@@ -3417,7 +3386,7 @@ describe('createNFT', () => {
     const addr0 = await hWallet.getAddressAtIndex(0);
     const addr2_0 = await hWallet2.getAddressAtIndex(0);
     const addr2_1 = await hWallet2.getAddressAtIndex(1);
-    await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    await fundAddress(hWallet, addr0, 10n);
 
     // Error creating token with external address
     await expect(
@@ -3479,7 +3448,7 @@ describe('getToken methods', () => {
 
   it('should get the correct responses for a valid token', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     // Validating `getTokenDetails` for custom token not in this wallet
     await expect(hWallet.getTokenDetails(fakeTokenUid)).rejects.toThrow('Unknown token');
@@ -3558,7 +3527,7 @@ describe('signTx', () => {
     const hWallet = await generateWalletHelper();
 
     const addr0 = await hWallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hWallet, addr0, 10n);
+    await fundAddress(hWallet, addr0, 10n);
 
     const { hash: tokenUid } = await createTokenHelper(hWallet, 'Signatures token', 'SIGT', 100n);
 
@@ -3611,11 +3580,7 @@ describe('getTxHistory', () => {
     expect(txHistory).toHaveLength(0);
 
     // HTR transaction incoming
-    const tx1 = await GenesisWalletHelper.injectFunds(
-      hWallet,
-      await hWallet.getAddressAtIndex(0),
-      10n
-    );
+    const tx1 = await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
     txHistory = await hWallet.getTxHistory();
     expect(txHistory).toStrictEqual([
       expect.objectContaining({
@@ -3655,7 +3620,7 @@ describe('getTxHistory', () => {
 
   it('should show custom token transactions in correct order', async () => {
     const hWallet = await generateWalletHelper();
-    await GenesisWalletHelper.injectFunds(hWallet, await hWallet.getAddressAtIndex(0), 10n);
+    await fundAddress(hWallet, await hWallet.getAddressAtIndex(0), 10n);
 
     let txHistory = await hWallet.getTxHistory({
       token_id: fakeTokenUid,

@@ -1,5 +1,6 @@
 import { isEmpty } from 'lodash';
 import { GenesisWalletHelper } from '../../helpers/genesis-wallet.helper';
+import { fundAddress } from '../../helpers/integration-test-helper-service';
 import {
   DEFAULT_PIN_CODE,
   generateWalletHelper,
@@ -45,7 +46,7 @@ describe('Template execution', () => {
     hWallet = await generateWalletHelper(null);
     interpreter = new WalletTxTemplateInterpreter(hWallet);
     const address = await hWallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hWallet, address, 1000n, {});
+    await fundAddress(hWallet, address, 1000n, {});
   });
 
   afterAll(async () => {

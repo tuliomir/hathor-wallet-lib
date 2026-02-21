@@ -1,4 +1,5 @@
 import { GenesisWalletHelper } from '../../helpers/genesis-wallet.helper';
+import { fundAddress } from '../../helpers/integration-test-helper-service';
 import {
   DEFAULT_PIN_CODE,
   generateWalletHelper,
@@ -30,7 +31,7 @@ describe('Template execution', () => {
     hWallet = await generateWalletHelper(null);
     interpreter = new WalletTxTemplateInterpreter(hWallet);
     const address = await hWallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hWallet, address, 10n, {});
+    await fundAddress(hWallet, address, 10n, {});
   });
 
   afterAll(async () => {
@@ -366,7 +367,7 @@ describe('Template execution', () => {
 
   it('should be able to create tokens using the complete calculateFee', async () => {
     const address = await hWallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hWallet, address, 10n, {});
+    await fundAddress(hWallet, address, 10n, {});
 
     /**
      * Create a token with mint/melt and 500 supply.
@@ -453,7 +454,7 @@ describe('Template execution with fee tokens', () => {
     hWallet = await generateWalletHelper(null);
     interpreter = new WalletTxTemplateInterpreter(hWallet);
     const address = await hWallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hWallet, address, 10n, {});
+    await fundAddress(hWallet, address, 10n, {});
   });
 
   afterAll(async () => {

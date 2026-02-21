@@ -1,5 +1,5 @@
 import { GenesisWalletHelper } from '../helpers/genesis-wallet.helper';
-import { getSimpleWallet } from '../helpers/integration-test-helper-service';
+import { fundAddress, getSimpleWallet } from '../helpers/integration-test-helper-service';
 import {
   DEFAULT_PIN_CODE,
   DEFAULT_PASSWORD,
@@ -69,7 +69,7 @@ describe('locked utxos', () => {
   async function testUnlockWhenSpent(storage, walletData) {
     const hwallet = await startWallet(storage, walletData);
     const address = await hwallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hwallet, address, 1n);
+    await fundAddress(hwallet, address, 1n);
 
     const sendTx = new SendTransaction({
       storage: hwallet.storage,
@@ -115,7 +115,7 @@ describe('custom signature method', () => {
   it('should check that we have an external signature method', async () => {
     const hwallet = await generateWalletHelper();
     const address = await hwallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hwallet, address, 10n);
+    await fundAddress(hwallet, address, 10n);
 
     expect(hwallet.storage.hasTxSignatureMethod()).toEqual(false);
     const customSignFunc = jest
@@ -128,7 +128,7 @@ describe('custom signature method', () => {
   it('should sign transactions with custom signature method', async () => {
     const hwallet = await generateWalletHelper();
     const address = await hwallet.getAddressAtIndex(0);
-    await GenesisWalletHelper.injectFunds(hwallet, address, 10n);
+    await fundAddress(hwallet, address, 10n);
 
     const customSignFunc = jest
       .fn()

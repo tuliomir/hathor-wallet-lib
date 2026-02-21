@@ -50,13 +50,13 @@ export async function fundAddress(
   address: string,
   value: OutputValueType,
   options?: { waitTimeout?: number }
-): Promise<FundResult> {
+): Promise<FundResult & { hash: string }> {
   const response = await axios.post(`${TEST_HELPER_URL}/fund`, {
     address,
-    amount: value,
+    amount: Number(value),
   });
   const { txId, amount, utxoSource } = response.data;
-  const result: FundResult = { txId, amount, utxoSource };
+  const result: FundResult & { hash: string } = { txId, amount, utxoSource, hash: txId };
 
   if (options?.waitTimeout === 0) {
     return result;
