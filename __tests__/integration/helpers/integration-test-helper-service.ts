@@ -46,7 +46,8 @@ export async function getSimpleWallet(): Promise<SimpleWalletData> {
  *                                Set to 0 to skip waiting entirely.
  */
 export async function fundAddress(
-  destinationWallet: HathorWallet,
+  destinationWallet?: HathorWallet,
+  // @ts-expect-error Keeping backward compatibility with existing calls
   address: string,
   value: OutputValueType,
   options?: { waitTimeout?: number }
@@ -62,8 +63,12 @@ export async function fundAddress(
     return result;
   }
 
-  await waitForTxReceived(destinationWallet, txId, options?.waitTimeout);
-  await waitUntilNextTimestamp(destinationWallet, txId);
+  // On rare occasions the destination wallet will not be available.
+  // It will be the caller responsibility to wait for the transaction
+  if (destinationWallet) {
+    await waitForTxReceived(destinationWallet, txId, options?.waitTimeout);
+    await waitUntilNextTimestamp(destinationWallet, txId);
+  }
 
   return result;
 }
