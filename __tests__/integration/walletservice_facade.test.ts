@@ -30,6 +30,7 @@ import { delay } from './utils/core.util';
 import { SendTxError, TxNotFoundError, UtxoError, WalletRequestError } from '../../src/errors';
 import { GetAddressesObject } from '../../src/wallet/types';
 import { TokenVersion } from '../../src/types';
+import { fundAddress } from './helpers/integration-test-helper-service';
 
 // Set base URL for the wallet service API inside the privatenet test container
 config.setServerUrl(FULLNODE_URL);
@@ -215,7 +216,7 @@ function buildWalletInstance({
  */
 async function pollForTx(walletForPolling: HathorWalletServiceWallet, txId: string) {
   const maxAttempts = 10;
-  const delayMs = 1000; // 1 second
+  const delayMs = 150; // 0.15 seconds
   let attempts = 0;
 
   while (attempts < maxAttempts) {
@@ -242,17 +243,12 @@ async function sendFundTx(
   amount: bigint,
   destinationWallet?: HathorWalletServiceWallet
 ) {
-  const fundTx = await gWallet.sendTransaction(address, amount, {
-    pinCode,
-  });
+  // fundAddress now handles waiting for the destination wallet internally
+  // (polling via getTxById for wallet-service wallets)
+  const fundTx = await fundAddress(destinationWallet, address, amount);
 
-  // Ensure the transaction was sent from the Genesis perspective
+  // Ensure the transaction was also indexed by the genesis wallet
   await pollForTx(gWallet, fundTx.hash!);
-
-  // Ensure the destination wallet is also aware of the transaction
-  if (destinationWallet) {
-    await pollForTx(destinationWallet, fundTx.hash!);
-  }
 
   return fundTx;
 }
