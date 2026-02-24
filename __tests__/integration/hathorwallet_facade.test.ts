@@ -40,6 +40,8 @@ import { TransactionTemplateBuilder } from '../../src/template/transaction';
 import FeeHeader from '../../src/headers/fee';
 import Header from '../../src/headers/base';
 import CreateTokenTransaction from '../../src/models/create_token_transaction';
+import { fullnodeTxApiTxSchema } from '../../src/api/schemas/txApi';
+import { z } from 'zod';
 
 const fakeTokenUid = '008a19f84f2ae284f19bf3d03386c878ddd15b8b0b604a3a3539aa9d714686e1';
 const sampleNftData =
@@ -208,16 +210,22 @@ describe('getTxById', () => {
     expect(firstTokenDetails.balance).toStrictEqual(10n);
 
     // throw error if token uid not found in tokens list
+    const tx1Response = await hWallet.getFullTxById(tx1.hash);
+    const tx1Full = tx1Response.tx as z.infer<typeof fullnodeTxApiTxSchema>;
+    if (!tx1Full) {
+      throw new Error(`No full transaction found for ${tx1.hash}`);
+    }
+    // FixMe: Mocks should be implemented on unit tests instead of integration ones
     jest.spyOn(hWallet, 'getFullTxById').mockResolvedValue({
       success: true,
       tx: {
-        ...tx1,
+        ...tx1Full,
         // impossible token_data
-        inputs: [{ ...tx1.inputs[0], token_data: -1 }],
+        inputs: [{ ...tx1Full.inputs[0], token_data: -1 }],
       },
     });
     await expect(hWallet.getTxById(tx1.hash)).rejects.toThrow(
-      'Invalid token_data undefined, token not found in tokens list'
+      'Invalid token_data -1, token not found in tokens list'
     );
     jest.spyOn(hWallet, 'getFullTxById').mockRestore();
 
