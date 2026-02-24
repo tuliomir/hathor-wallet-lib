@@ -299,7 +299,7 @@ export async function waitForTxReceived(
     }
 
     // Tx not found, wait 1s before trying again
-    await delay(1000);
+    await delay(150);
     storageTx = (await hWallet.getTx(txId)) as IHistoryTx;
   }
 
@@ -427,7 +427,7 @@ export async function waitNextBlock(storage) {
       break;
     }
 
-    await delay(1000);
+    await delay(500);
     height = await storage.getCurrentHeight();
   }
 
@@ -470,7 +470,7 @@ export async function waitTxConfirmed(
     // the nano contract txs are executing the method as soon as they arrive in the node
     // and adding the first_block as mempool so we shouldn't consider this as a valid first block for confirmation
     while (includes([null, 'mempool'], await getTxFirstBlock(hWallet, txId))) {
-      await delay(1000);
+      await delay(500);
 
       // If we've reached the requested timeout, break the while loop
       if (timeoutErrorFlag) {
