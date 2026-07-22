@@ -10,6 +10,7 @@ import {
   ILogger,
   AddressScanPolicyData,
   IHistoryTx,
+  IPrecalculatedShieldedAddress,
   OutputValueType,
   TokenVersion,
 } from '../types';
@@ -71,6 +72,12 @@ export interface HathorWalletConstructorParams {
   multisig?: { pubkeys: string[]; numSignatures: number } | null;
   /** Pre-calculated addresses to load into storage */
   preCalculatedAddresses?: string[] | null;
+  /**
+   * Pre-calculated shielded address pairs to load into storage (test tooling,
+   * mirrors preCalculatedAddresses). Injected indexes skip live EC derivation
+   * in address loading; indexes past the injected window still derive live.
+   */
+  preCalculatedShieldedAddresses?: IPrecalculatedShieldedAddress[] | null;
   /** Address scanning policy configuration */
   scanPolicy?: AddressScanPolicyData | null;
   /** Logger instance for wallet operations */
@@ -97,16 +104,27 @@ export interface UtxoOptions {
   amount_bigger_than?: bigint;
   max_amount?: bigint;
   only_available_utxos?: boolean;
+  /**
+   * Whether to include shielded UTXOs. Defaults to `false` (transparent-only):
+   * `getUtxos` feeds consolidation, which spends its results as TRANSPARENT
+   * inputs, so a shielded UTXO must never leak into that listing. Pass `true`
+   * to explicitly include shielded UTXOs.
+   */
+  shielded?: boolean;
 }
 
 /**
  * Options for filtering available UTXOs
  * @property token Search for UTXOs of this token UID
  * @property filter_address Address to filter the utxos
+ * @property shielded Include shielded UTXOs. Defaults to `false`
+ *   (transparent-only) because the results feed transparent-only input
+ *   selection; pass `true` to explicitly include shielded UTXOs.
  */
 export interface GetAvailableUtxosOptions {
   token?: string;
   filter_address?: string;
+  shielded?: boolean;
 }
 
 /**
@@ -238,21 +256,13 @@ export interface WalletWebSocketData {
 }
 
 /**
- * Options for creating nano contract transactions
- * @property pinCode PIN to decrypt the private key
- */
-export interface CreateNanoTxOptions {
-  pinCode?: string | null;
-}
-
-/**
  * Data for creating nano contract transactions
  * @property blueprintId ID of the blueprint to create the nano contract. Required if method is 'initialize'
  * @property ncId ID of the nano contract to execute method. Required if method is not initialize
  * @property actions List of actions to execute in the nano contract transaction
  * @property args List of arguments for the method to be executed in the transaction
  */
-export interface CreateNanoTxData {
+export interface FullnodeCreateNanoTxData {
   blueprintId?: string | null;
   ncId?: string | null;
   actions?: NanoContractAction[];
@@ -291,6 +301,7 @@ export interface CreateNanoTokenTxOptions {
   allowExternalMeltAuthorityAddress?: boolean;
   data?: string[] | null;
   isCreateNFT?: boolean;
+  tokenVersion?: TokenVersion;
 }
 
 /**
@@ -345,6 +356,23 @@ export interface ProposedOutput {
   value: OutputValueType;
   timelock?: number;
   token: string;
+}
+
+/**
+ * The unblinding data the wallet holds for a single shielded output/input it
+ * owns: the cleartext `value`/`token` plus the value blinding factor (`vbf`)
+ * and, for FullShielded slots, the asset blinding factor (`abf`).
+ */
+export interface ShieldedOpening {
+  value: bigint;
+  token: string;
+  vbf: string;
+  abf?: string;
+}
+
+/** A {@link ShieldedOpening} tagged with the on-chain absolute slot index. */
+export interface ShieldedOpeningEntry extends ShieldedOpening {
+  index: number;
 }
 
 /**
@@ -442,6 +470,19 @@ export interface GetTxHistoryFullnodeFacadeReturnType {
   ncMethod?: string;
   ncCaller?: Address; // Address type
   firstBlock?: string;
+  /**
+   * Tx-level headers (FeeHeader, etc.) carried through unchanged from
+   * the on-chain payload so callers can compute network fees without
+   * a second `getTx` round-trip.
+   */
+  headers?: unknown[];
+  /**
+   * Shielded output entries from `tx.shielded_outputs[]`. Each entry's
+   * `mode` (1 = AmountShielded, 2 = FullShielded) is the only field
+   * the privacy-fee accumulator needs; others are passed through for
+   * future use.
+   */
+  shielded_outputs?: { mode?: number }[];
 }
 
 /**

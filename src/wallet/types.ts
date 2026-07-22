@@ -6,13 +6,23 @@
  */
 
 import bitcore from 'bitcore-lib';
-import { TokenVersion, IStorage, OutputValueType, IHistoryTx } from '../types';
+import {
+  TokenVersion,
+  IStorage,
+  OutputValueType,
+  IHistoryTx,
+  IDataTx,
+  WalletAddressMode,
+  IAddressChainOptions,
+} from '../types';
 import Transaction from '../models/transaction';
 import CreateTokenTransaction from '../models/create_token_transaction';
 import SendTransactionWalletService from './sendTransactionWalletService';
 import Input from '../models/input';
 import Output from '../models/output';
-import { CreateNanoTxData } from '../nano_contracts/types';
+import { CreateNanoTxData, CreateNanoTxOptions } from '../nano_contracts/types';
+import NanoContractHeader from '../nano_contracts/header';
+import type { IShieldedCryptoProvider } from '../shielded/types';
 
 // Type used in create token methods so we can have defaults for required params
 export type CreateTokenOptionsInput = {
@@ -32,6 +42,8 @@ export type CreateTokenOptionsInput = {
   allowExternalMeltAuthorityAddress?: boolean;
   data?: string[] | null;
   isCreateNFT?: boolean;
+  // Token version (DEPOSIT or FEE) - defaults to DEPOSIT
+  tokenVersion?: TokenVersion;
 };
 
 export interface GetAddressesObject {
@@ -42,7 +54,7 @@ export interface GetAddressesObject {
 
 export interface GetBalanceObject {
   token: TokenInfo; // Information about the token
-  balance: Balance; // Balance information
+  balance: WalletServiceBalance; // Balance information
   tokenAuthorities: AuthoritiesBalance; // Authorities mint/melt availability
   transactions: number; // quantity of transactions
   lockExpires: number | null; // When next lock expires, if has a timelock
@@ -55,17 +67,17 @@ export interface TokenInfo {
   version: TokenVersion; // Token version
 }
 
-export interface Balance {
+export interface WalletServiceBalance {
   unlocked: OutputValueType; // Available amount
   locked: OutputValueType; // Locked amount
 }
 
 export interface AuthoritiesBalance {
-  unlocked: Authority; // unlocked mint/melt
-  locked: Authority; // locked mint/melt
+  unlocked: WalletServiceAuthority; // unlocked mint/melt
+  locked: WalletServiceAuthority; // locked mint/melt
 }
 
-export interface Authority {
+export interface WalletServiceAuthority {
   mint: boolean; // if has mint authority
   melt: boolean; // if has melt authority
 }
@@ -317,13 +329,13 @@ export interface IStopWalletParams {
   cleanAddresses?: boolean;
 }
 
-export interface DelegateAuthorityOptions {
+export interface WalletServiceDelegateAuthorityOptions {
   anotherAuthorityAddress: string | null;
   createAnother: boolean;
   pinCode: string | null;
 }
 
-export interface DestroyAuthorityOptions {
+export interface WalletServiceDestroyAuthorityOptions {
   pinCode: string | null;
 }
 
@@ -331,7 +343,8 @@ export interface IHathorWallet {
   start(options: { pinCode: string; password: string; waitReady?: boolean }): Promise<void>;
   startReadOnly(options?: { skipAddressFetch?: boolean }): Promise<void>;
   getReadOnlyAuthToken(): Promise<string>;
-  getAllAddresses(): AsyncGenerator<GetAddressesObject>;
+  setShieldedCryptoProvider(provider?: IShieldedCryptoProvider): void;
+  getAllAddresses(opts?: IAddressChainOptions): AsyncGenerator<GetAddressesObject>;
   getBalance(token: string | null): Promise<GetBalanceObject[]>;
   getTokens(): Promise<string[]>;
   getTxHistory(options: {
@@ -349,10 +362,15 @@ export interface IHathorWallet {
     options: { token?: string; changeAddress?: string }
   ): Promise<Transaction>;
   stop(params?: IStopWalletParams): void;
-  getAddressAtIndex(index: number): Promise<string>;
+  getAddressAtIndex(index: number, opts?: IAddressChainOptions): Promise<string>;
   getAddressIndex(address: string): Promise<number | null>;
-  getCurrentAddress(options?: { markAsUsed: boolean }): AddressInfoObject | Promise<unknown>; // FIXME: Should have a single return type
-  getNextAddress(): AddressInfoObject | Promise<unknown>; // FIXME: Should have a single return type;
+  getCurrentAddress(
+    options?: {
+      markAsUsed: boolean;
+    },
+    opts?: IAddressChainOptions
+  ): AddressInfoObject | Promise<AddressInfoObject>; // FIXME: Should have a single return type
+  getNextAddress(opts?: IAddressChainOptions): AddressInfoObject | Promise<AddressInfoObject>; // FIXME: Should have a single return type;
   getAddressPrivKey(pinCode: string, addressIndex: number): Promise<bitcore.PrivateKey>;
   signMessageWithAddress(message: string, index: number, pinCode: string): Promise<string>;
   prepareCreateNewToken(
@@ -378,29 +396,31 @@ export interface IHathorWallet {
   mintTokens(token: string, amount: OutputValueType, options): Promise<Transaction>;
   prepareMeltTokensData(token: string, amount: OutputValueType, options): Promise<Transaction>;
   meltTokens(token: string, amount: OutputValueType, options): Promise<Transaction>;
+  getDepositAmount(mintAmount: OutputValueType): OutputValueType;
+  getWithdrawAmount(meltAmount: OutputValueType): OutputValueType;
   prepareDelegateAuthorityData(
     token: string,
     type: string,
     address: string,
-    options: DelegateAuthorityOptions
+    options: WalletServiceDelegateAuthorityOptions
   ): Promise<Transaction>;
   delegateAuthority(
     token: string,
     type: string,
     address: string,
-    options: DelegateAuthorityOptions
+    options: WalletServiceDelegateAuthorityOptions
   ): Promise<Transaction>;
   prepareDestroyAuthorityData(
     token: string,
     type: string,
     count: number,
-    options: DestroyAuthorityOptions
+    options: WalletServiceDestroyAuthorityOptions
   ): Promise<Transaction>;
   destroyAuthority(
     token: string,
     type: string,
     count: number,
-    options: DestroyAuthorityOptions
+    options: WalletServiceDestroyAuthorityOptions
   ): Promise<Transaction>;
   getFullHistory(): TransactionFullObject[] | Promise<unknown>; // FIXME: Should have a single return type;
   getTxBalance(tx: IHistoryTx, optionsParams): Promise<{ [tokenId: string]: OutputValueType }>;
@@ -414,9 +434,10 @@ export interface IHathorWallet {
   checkPin(pin: string): Promise<boolean>;
   checkPassword(password: string): Promise<boolean>;
   checkPinAndPassword(pin: string, password: string): Promise<boolean>;
+  changeServer(newServer: string): Promise<void>;
   getServerUrl(): string;
   getNetwork(): string;
-  getAddressPathForIndex(index: number): Promise<string>;
+  getAddressPathForIndex(index: number, opts?: IAddressChainOptions): Promise<string>;
   sendManyOutputsSendTransaction(
     outputs: Array<OutputRequestObj | DataScriptOutputRequestObj>,
     options?: { inputs?: InputRequestObj[]; changeAddress?: string; pinCode?: string }
@@ -425,28 +446,29 @@ export interface IHathorWallet {
     method: string,
     address: string,
     data: CreateNanoTxData,
-    options?: { pinCode?: string }
+    options?: CreateNanoTxOptions
   ): Promise<SendTransactionWalletService>;
   createAndSendNanoContractTransaction(
     method: string,
     address: string,
     data: CreateNanoTxData,
-    options?: { pinCode?: string }
+    options?: CreateNanoTxOptions
   ): Promise<Transaction>;
   createNanoContractCreateTokenTransaction(
     method: string,
     address: string,
     data: CreateNanoTxData,
     createTokenOptions: CreateTokenOptionsInput,
-    options?: { pinCode?: string }
+    options?: CreateNanoTxOptions
   ): Promise<SendTransactionWalletService>;
   createAndSendNanoContractCreateTokenTransaction(
     method: string,
     address: string,
     data: CreateNanoTxData,
     createTokenOptions: CreateTokenOptionsInput,
-    options?: { pinCode?: string }
+    options?: CreateNanoTxOptions
   ): Promise<Transaction>;
+  getNanoHeaderSeqnum(address: string): Promise<number>;
   isAddressMine(address: string): Promise<boolean>;
   getUtxosForAmount(
     amount: OutputValueType,
@@ -482,11 +504,24 @@ export interface IHathorWallet {
   hasTxOutsideFirstAddress(): Promise<boolean>;
   pinCode?: string | null;
   storage: IStorage;
+  signTx(tx: Transaction, options: { pinCode?: string | null }): Promise<Transaction>;
+  setNanoHeaderCaller(nanoHeader: NanoContractHeader, address: string): Promise<void>;
+  getAddressMode(): Promise<WalletAddressMode>;
+  enableMultiAddressMode(): Promise<void>;
+  enableSingleAddressMode(): Promise<void>;
 }
 
 export interface ISendTransaction {
-  run(until: string | null): Promise<Transaction>;
-  runFromMining(until: string | null): Promise<Transaction>;
+  run(
+    until?: 'prepare-tx' | 'sign-tx' | 'mine-tx' | null,
+    pin?: string | null
+  ): Promise<Transaction>;
+  runFromMining(until?: 'mine-tx' | null): Promise<Transaction>;
+  prepareTx(): Promise<Transaction>;
+  signTx(pin?: string | null): Promise<Transaction>;
+  releaseUtxos(): Promise<void>;
+  readonly transaction: Transaction | null;
+  readonly fullTxData: IDataTx | null;
 }
 
 export interface MineTxSuccessData {
@@ -615,7 +650,12 @@ export interface FullNodeVersionData {
   minTxWeight: number;
   minTxWeightCoefficient: number;
   minTxWeightK: number;
-  tokenDepositPercentage: number;
+  /** @deprecated Prefer the numerator/denominator fraction below (integer precision). Optional: fullnodes will stop sending it. */
+  tokenDepositPercentage?: number;
+  /** Token deposit percentage numerator (parts per billion). Absent on older fullnodes. */
+  tokenDepositPercentageNumerator?: number;
+  /** Token deposit percentage denominator (parts per billion). Absent on older fullnodes. */
+  tokenDepositPercentageDenominator?: number;
   rewardSpendMinBlocks: number;
   maxNumberInputs: number;
   maxNumberOutputs: number;
@@ -697,6 +737,8 @@ export interface FullNodeOutput {
   decoded: FullNodeDecodedOutput;
   token?: string | null;
   spent_by?: string | null;
+  // Shielded entries appended by fullnode's to_json_extended() have type='shielded'
+  type?: string;
 }
 
 export interface FullNodeTx {

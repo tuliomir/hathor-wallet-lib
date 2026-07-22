@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import { HDPrivateKey } from 'bitcore-lib';
 import { TOKEN_AUTHORITY_MASK, NATIVE_TOKEN_UID } from '../../src/constants';
 import SendTransaction, {
   isDataOutput,
@@ -16,6 +17,41 @@ import { WalletType } from '../../src/types';
 import transaction from '../../src/utils/transaction';
 import { OutputType } from '../../src/wallet/types';
 import { mockGetToken } from '../__mock_helpers__/get-token.mock';
+import { encodeShieldedAddress } from '../../src/utils/shieldedAddress';
+import Network from '../../src/models/network';
+
+test('prepareTxData rejects a shielded address in a transparent output', async () => {
+  const store = new MemoryStore();
+  const storage = new Storage(store);
+  storage.config.setNetwork('testnet');
+
+  // Genuine curve points (encode/extract validate on-curve membership).
+  const root = HDPrivateKey.fromSeed(Buffer.alloc(32, 0x09), 'testnet');
+  const shieldedAddress = encodeShieldedAddress(
+    root.deriveChild("m/0'/0").publicKey.toBuffer(),
+    root.deriveChild("m/1'/0").publicKey.toBuffer(),
+    new Network('testnet')
+  );
+
+  const sendTransaction = new SendTransaction({
+    storage,
+    outputs: [
+      {
+        type: OutputType.P2PKH,
+        address: shieldedAddress,
+        value: 10n,
+        token: NATIVE_TOKEN_UID,
+      },
+    ],
+  });
+
+  // The transparent pipeline must fail loudly BEFORE any utxo selection:
+  // shielded routing only lands in PR 6, and a 71-byte address has no
+  // transparent output script form.
+  await expect(sendTransaction.prepareTxData()).rejects.toThrow(
+    /Shielded addresses cannot be used directly as output script type/
+  );
+});
 
 test('type methods', () => {
   // The ISendInput and ISendOutput were created to satisfy the old facade methods while using typescript
@@ -169,9 +205,12 @@ test('prepareTxData', async () => {
     tokens: ['01'],
   });
 
-  await expect(sendTransaction.prepareTx()).rejects.toThrow('Pin is not set.');
-  sendTransaction.pin = '000000';
+  // prepareTx does not require a PIN (creates unsigned transaction)
   await expect(sendTransaction.prepareTx()).resolves.toBe(preparedTx);
+
+  // signTx requires a PIN
+  await expect(sendTransaction.signTx()).rejects.toThrow('Pin is not set.');
+  sendTransaction.pin = '000000';
 
   prepareSpy.mockRestore();
   spyGetToken.mockRestore();
@@ -433,4 +472,74 @@ test('prepareSendTokensData', async () => {
   });
   // Reset mocks
   prepareSpy.mockRestore();
+});
+
+describe('releaseUtxos', () => {
+  it('should unmark all transaction inputs as selected', async () => {
+    const store = new MemoryStore();
+    const storage = new Storage(store);
+    const utxoSelectSpy = jest.spyOn(storage, 'utxoSelectAsInput');
+
+    const sendTx = new SendTransaction({ storage, outputs: [], inputs: [] });
+
+    const mockTx = {
+      inputs: [
+        { hash: 'tx1', index: 0 },
+        { hash: 'tx2', index: 1 },
+      ],
+    } as unknown as import('../../src/models/transaction').default;
+    sendTx.transaction = mockTx;
+
+    await sendTx.releaseUtxos();
+
+    expect(utxoSelectSpy).toHaveBeenCalledTimes(2);
+    expect(utxoSelectSpy).toHaveBeenCalledWith({ txId: 'tx1', index: 0 }, false);
+    expect(utxoSelectSpy).toHaveBeenCalledWith({ txId: 'tx2', index: 1 }, false);
+  });
+
+  it('should no-op when transaction is null', async () => {
+    const store = new MemoryStore();
+    const storage = new Storage(store);
+    const utxoSelectSpy = jest.spyOn(storage, 'utxoSelectAsInput');
+
+    const sendTx = new SendTransaction({ storage, outputs: [], inputs: [] });
+
+    await sendTx.releaseUtxos();
+
+    expect(utxoSelectSpy).not.toHaveBeenCalled();
+  });
+
+  it('should no-op when storage is not set', async () => {
+    const sendTx = new SendTransaction({ outputs: [], inputs: [] });
+
+    const mockTx = {
+      inputs: [{ hash: 'tx1', index: 0 }],
+    } as unknown as import('../../src/models/transaction').default;
+    sendTx.transaction = mockTx;
+
+    // Should resolve without throwing
+    await expect(sendTx.releaseUtxos()).resolves.toBeUndefined();
+  });
+
+  it('should continue releasing remaining UTXOs if one fails', async () => {
+    const store = new MemoryStore();
+    const storage = new Storage(store);
+    const utxoSelectSpy = jest
+      .spyOn(storage, 'utxoSelectAsInput')
+      .mockRejectedValueOnce(new Error('fail'))
+      .mockResolvedValueOnce(undefined);
+
+    const sendTx = new SendTransaction({ storage, outputs: [], inputs: [] });
+    const mockTx = {
+      inputs: [
+        { hash: 'tx1', index: 0 },
+        { hash: 'tx2', index: 1 },
+      ],
+    } as unknown as import('../../src/models/transaction').default;
+    sendTx.transaction = mockTx;
+
+    await sendTx.releaseUtxos(); // should not throw
+
+    expect(utxoSelectSpy).toHaveBeenCalledTimes(2);
+  });
 });

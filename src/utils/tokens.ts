@@ -11,7 +11,8 @@ import Header from '../headers/base';
 import {
   CREATE_TOKEN_TX_VERSION,
   NATIVE_TOKEN_UID,
-  TOKEN_DEPOSIT_PERCENTAGE,
+  TOKEN_DEPOSIT_PERCENTAGE_DENOMINATOR,
+  TOKEN_DEPOSIT_PERCENTAGE_NUMERATOR,
   TOKEN_INDEX_MASK,
   TOKEN_MELT_MASK,
   TOKEN_MINT_MASK,
@@ -30,6 +31,7 @@ import {
   UtxoSelectionAlgorithm,
 } from '../types';
 import { getAddressType } from './address';
+import { ceilDiv } from './bigint';
 import {
   InsufficientFundsError,
   SendTxError,
@@ -299,25 +301,28 @@ const tokens = {
   },
 
   /**
-   * Calculate deposit value for the given token mint amount
+   * Calculate deposit value for the given token mint amount.
    *
    * @param {OutputValueType} mintAmount Amount of tokens being minted
-   * @param {number} [depositPercent=TOKEN_DEPOSIT_PERCENTAGE] token deposit percentage.
+   * @param {bigint} [depositNumerator=TOKEN_DEPOSIT_PERCENTAGE_NUMERATOR] deposit percentage numerator.
+   * @param {bigint} [depositDenominator=TOKEN_DEPOSIT_PERCENTAGE_DENOMINATOR] deposit percentage denominator.
    *
-   * @return {number}
+   * @return {OutputValueType}
    * @memberof Tokens
    * @inner
    *
    */
   getDepositAmount(
     mintAmount: OutputValueType,
-    depositPercent: number = TOKEN_DEPOSIT_PERCENTAGE
+    depositNumerator: bigint = TOKEN_DEPOSIT_PERCENTAGE_NUMERATOR,
+    depositDenominator: bigint = TOKEN_DEPOSIT_PERCENTAGE_DENOMINATOR
   ): OutputValueType {
-    // This conversion from mintAmount to Number may cause loss of precision for large amounts,
-    // but this is fully equivalent to the reference Python implementation, which does the same.
-    // It'll never be a problem for mainnet as no values can reach the precision boundary, but
-    // it may happen in custom networks.
-    return BigInt(Math.ceil(depositPercent * Number(mintAmount)));
+    // Coerce to bigint so callers passing a number keep working (the API previously used Number()).
+    const amount = BigInt(mintAmount);
+    if (mintAmount < 0) {
+      throw new Error('mint amount should not be negative');
+    }
+    return ceilDiv(depositNumerator * amount, depositDenominator);
   },
 
   /**
@@ -329,21 +334,25 @@ const tokens = {
   },
 
   /**
-   * Calculate withdraw value for the given token melt amount
+   * Calculate withdraw value for the given token melt amount.
    *
    * @param {OutputValueType} meltAmount Amount of tokens being melted
-   * @param {number} [depositPercent=TOKEN_DEPOSIT_PERCENTAGE] token deposit percentage.
+   * @param {bigint} [depositNumerator=TOKEN_DEPOSIT_PERCENTAGE_NUMERATOR] deposit percentage numerator.
+   * @param {bigint} [depositDenominator=TOKEN_DEPOSIT_PERCENTAGE_DENOMINATOR] deposit percentage denominator.
    *
-   * @return {number}
+   * @return {OutputValueType}
    * @memberof Tokens
    * @inner
    *
    */
   getWithdrawAmount(
     meltAmount: OutputValueType,
-    depositPercent: number = TOKEN_DEPOSIT_PERCENTAGE
+    depositNumerator: bigint = TOKEN_DEPOSIT_PERCENTAGE_NUMERATOR,
+    depositDenominator: bigint = TOKEN_DEPOSIT_PERCENTAGE_DENOMINATOR
   ): OutputValueType {
-    return BigInt(Math.floor(depositPercent * Number(meltAmount)));
+    // Coerce to bigint so callers passing a number keep working (the API previously used Number()).
+    const amount = BigInt(meltAmount);
+    return (depositNumerator * amount) / depositDenominator;
   },
 
   /**
@@ -380,6 +389,7 @@ const tokens = {
       mintAuthorityAddress = null,
       utxoSelection = bestUtxoSelection,
       skipDepositFee = false,
+      skipFeeCalculation = false,
       tokenVersion = TokenVersion.DEPOSIT,
     }: {
       token?: string | null;
@@ -391,7 +401,8 @@ const tokens = {
       mintAuthorityAddress?: string | null;
       utxoSelection?: UtxoSelectionAlgorithm;
       skipDepositFee?: boolean;
-      tokenVersion: TokenVersion;
+      skipFeeCalculation?: boolean;
+      tokenVersion?: TokenVersion;
     }
   ): Promise<IDataTx> {
     const inputs: IDataInput[] = [];
@@ -454,35 +465,19 @@ const tokens = {
           depositAmount += this.getTransactionHTRDeposit(amount, data?.length ?? 0, storage);
         }
         break;
-      case TokenVersion.FEE:
-        // is creating a new token
-        if (skipDepositFee) {
-          feeAmount = 0n;
-        } else if (!isMintingToken) {
-          feeAmount = Fee.calculateTokenCreationTxFee(outputs);
-        } else {
-          const mappedOutputs = outputs.map(
-            output =>
-              ({
-                ...output,
-                token: token!,
-              }) satisfies IDataOutputWithToken
-          );
-          // since we control the inputs, we can assume we don't have any melt operation that should be charged at this point.
-          // so we can pass an empty array for inputs
-          feeAmount = await Fee.calculate(
-            [],
-            mappedOutputs,
-            await tokens.getTokensByManyIds(storage, new Set(tokensArray))
-          );
-
-          if (data) {
-            // The deposit amount will be the quantity of data strings in the array
-            // multiplied by the fee (this fee is not related to the trasanction fee that is calculated based in the token version)
-            depositAmount += this.getDataFee(data.length);
-          }
-        }
+      case TokenVersion.FEE: {
+        const feeResult = await this.calculateFeeForMintAndCreateToken({
+          skipFeeCalculation,
+          mintingTokenUid: isMintingToken ? token! : undefined,
+          outputs,
+          data: data ?? undefined,
+          tokensArray,
+          storage,
+        });
+        feeAmount = feeResult.feeAmount;
+        depositAmount += feeResult.depositAmount;
         break;
+      }
       default:
         throw new Error('Invalid token version');
     }
@@ -620,8 +615,8 @@ const tokens = {
     let depositAmount = data !== null ? this.getDataScriptOutputFee() * BigInt(data.length) : 0n;
 
     if (tokenData.version === TokenVersion.DEPOSIT) {
-      const depositPercent = storage.getTokenDepositPercentage();
-      withdrawAmount = this.getWithdrawAmount(amount, depositPercent);
+      const { numerator, denominator } = storage.getTokenDepositPercentageFraction();
+      withdrawAmount = this.getWithdrawAmount(amount, numerator, denominator);
 
       // We only make these calculations if we are creating data outputs because the transaction needs to deposit the fee
       if (depositAmount > 0) {
@@ -790,6 +785,7 @@ const tokens = {
       data = null,
       isCreateNFT = false,
       skipDepositFee = false,
+      skipFeeCalculation = false,
       tokenVersion = TokenVersion.DEPOSIT,
     }: {
       changeAddress?: string | null;
@@ -800,6 +796,7 @@ const tokens = {
       data?: string[] | null;
       isCreateNFT?: boolean;
       skipDepositFee?: boolean;
+      skipFeeCalculation?: boolean;
       tokenVersion?: TokenVersion;
     } = {}
   ): Promise<IDataTx> {
@@ -810,6 +807,7 @@ const tokens = {
       unshiftData: isCreateNFT,
       data,
       skipDepositFee,
+      skipFeeCalculation,
       tokenVersion,
     };
 
@@ -939,8 +937,70 @@ const tokens = {
    * Get the deposit amount for a mint
    */
   getMintDeposit(mintAmount: OutputValueType, storage: IStorage): OutputValueType {
-    const depositPercent = storage.getTokenDepositPercentage();
-    return this.getDepositAmount(mintAmount, depositPercent);
+    const { numerator, denominator } = storage.getTokenDepositPercentageFraction();
+    return this.getDepositAmount(mintAmount, numerator, denominator);
+  },
+
+  /**
+   * Calculate the fee amount for a fee-based token transaction.
+   *
+   * @param options.skipFeeCalculation Whether to skip fee calculation (fee is managed externally)
+   * @param options.mintingTokenUid The token UID if minting an existing token; undefined if creating a new token
+   * @param options.outputs The transaction outputs
+   * @param options.data Optional data strings for data outputs
+   * @param options.tokensArray Array of token UIDs in the transaction
+   * @param options.storage The storage instance
+   * @returns An object containing the calculated feeAmount and depositAmount to add
+   */
+  async calculateFeeForMintAndCreateToken({
+    skipFeeCalculation,
+    mintingTokenUid,
+    outputs,
+    data,
+    tokensArray,
+    storage,
+  }: {
+    skipFeeCalculation: boolean;
+    mintingTokenUid?: string;
+    outputs: IDataOutput[];
+    data?: string[];
+    tokensArray: string[];
+    storage: IStorage;
+  }): Promise<{ feeAmount: bigint; depositAmount: bigint }> {
+    let feeAmount = 0n;
+    let depositAmount = 0n;
+
+    // skipFeeCalculation: fee is managed externally (e.g., by NanoContractTransactionBuilder)
+    if (skipFeeCalculation) {
+      return { feeAmount: 0n, depositAmount: 0n };
+    }
+
+    if (data) {
+      // The deposit amount will be the quantity of data strings in the array
+      // multiplied by the fee (this fee is not related to the trasanction fee that is calculated based in the token version)
+      depositAmount += this.getDataFee(data.length);
+    }
+
+    if (!mintingTokenUid) {
+      return { feeAmount: Fee.calculateTokenCreationTxFee(outputs), depositAmount };
+    }
+
+    const mappedOutputs = outputs.map(
+      output =>
+        ({
+          ...output,
+          token: mintingTokenUid,
+        }) satisfies IDataOutputWithToken
+    );
+    // since we control the inputs, we can assume we don't have any melt operation that should be charged at this point.
+    // so we can pass an empty array for inputs
+    feeAmount = await Fee.calculate(
+      [],
+      mappedOutputs,
+      await tokens.getTokensByManyIds(storage, new Set(tokensArray))
+    );
+
+    return { feeAmount, depositAmount };
   },
 
   /**

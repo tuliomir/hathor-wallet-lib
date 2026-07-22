@@ -5,11 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-/* eslint-disable @typescript-eslint/ban-ts-comment */
-/* eslint-disable @typescript-eslint/no-explicit-any */
-// @ts-nocheck
-/* eslint-enable @typescript-eslint/ban-ts-comment */
-
 /**
  * TypeScript Migration In Progress
  *
@@ -24,6 +19,8 @@
  *
  */
 
+/* eslint @typescript-eslint/explicit-function-return-type: "error" */
+
 import { cloneDeep, get } from 'lodash';
 import bitcore, { HDPrivateKey } from 'bitcore-lib';
 import EventEmitter from 'events';
@@ -33,6 +30,8 @@ import {
   ON_CHAIN_BLUEPRINTS_VERSION,
   P2PKH_ACCT_PATH,
   P2SH_ACCT_PATH,
+  SHIELDED_SPEND_ACCT_PATH,
+  GAP_LIMIT,
 } from '../constants';
 import tokenUtils from '../utils/tokens';
 import walletApi from '../api/wallet';
@@ -44,9 +43,9 @@ import { createP2SHRedeemScript } from '../utils/scripts';
 import walletUtils from '../utils/wallet';
 import SendTransaction from './sendTransaction';
 import Network from '../models/network';
-import Connection from '../connection';
 import {
   AddressError,
+  HasTxOutsideFirstAddressError,
   NanoContractTransactionError,
   PinRequiredError,
   TxNotFoundError,
@@ -59,13 +58,14 @@ import {
   ApiVersion,
   AddressScanPolicyData,
   AuthorityType,
-  FullNodeVersionData,
+  EcdsaTxSign,
   getDefaultLogger,
   HistorySyncMode,
   IHistoryTx,
   IIndexLimitAddressScanPolicy,
   ILogger,
   IMultisigData,
+  IPrecalculatedShieldedAddress,
   IStorage,
   ITokenData,
   IUtxo,
@@ -76,6 +76,8 @@ import {
   TxHistoryProcessingStatus,
   WalletState,
   WalletType,
+  WalletAddressMode,
+  IAddressChainOptions,
 } from '../types';
 import transactionUtils from '../utils/transaction';
 import Queue from '../models/queue';
@@ -83,27 +85,43 @@ import {
   checkScanningPolicy,
   getHistorySyncMethod,
   getSupportedSyncMode,
+  loadAddressHistory,
   processMetadataChanged,
+  savePrecalculatedShieldedAddresses,
   scanPolicyStartAddresses,
 } from '../utils/storage';
 import txApi from '../api/txApi';
 import { MemoryStore, Storage } from '../storage';
-import { deriveAddressP2PKH, deriveAddressP2SH, getAddressFromPubkey } from '../utils/address';
+import {
+  deriveAddressP2PKH,
+  deriveAddressP2SH,
+  deriveShieldedAddressFromStorage,
+  getAddressFromPubkey,
+} from '../utils/address';
 import NanoContractTransactionBuilder from '../nano_contracts/builder';
-import { prepareNanoSendTransaction } from '../nano_contracts/utils';
+import { prepareNanoSendTransaction, setNanoHeaderCallerFromWallet } from '../nano_contracts/utils';
 import OnChainBlueprint, { Code, CodeKind } from '../nano_contracts/on_chain_blueprint';
-import { NanoContractVertexType } from '../nano_contracts/types';
+import {
+  CreateNanoTxOptions,
+  NanoContractBuilderCreateTokenOptions,
+  NanoContractVertexType,
+} from '../nano_contracts/types';
 import { IHistoryTxSchema } from '../schemas';
 import GLL from '../sync/gll';
 import { TransactionTemplate, WalletTxTemplateInterpreter } from '../template/transaction';
 import Address from '../models/address';
+import type { HistoryTransactionOutput } from '../models/types';
+import type { IShieldedCryptoProvider } from '../shielded/types';
+import { ConnectionState, FullNodeVersionData, IHathorWallet, Utxo } from '../wallet/types';
 import Transaction from '../models/transaction';
 import {
   CreateNFTOptions,
   CreateTokenOptions,
+  FullnodeCreateNanoTxData,
+  CreateNanoTokenTxOptions,
+  CreateOnChainBlueprintTxOptions,
   DelegateAuthorityOptions,
   DestroyAuthorityOptions,
-  GeneralTokenInfoSchema,
   GetAuthorityOptions,
   GetAvailableUtxosOptions,
   GetBalanceFullnodeFacadeReturnType,
@@ -117,13 +135,18 @@ import {
   ISignature,
   IWalletInputInfo,
   ProposedOutput,
+  ShieldedOpening,
+  ShieldedOpeningEntry,
   SendManyOutputsOptions,
   UtxoDetails,
   UtxoOptions,
   SendTransactionFullnodeOptions,
+  WalletWebSocketData,
+  WalletStartOptions,
+  WalletStopOptions,
   BuildTxTemplateOptions,
+  StartReadOnlyOptions,
 } from './types';
-import { Utxo } from '../wallet/types';
 import {
   FullNodeTxApiResponse,
   GraphvizNeighboursDotResponse,
@@ -131,19 +154,13 @@ import {
   GraphvizNeighboursResponse,
   TransactionAccWeightResponse,
 } from '../api/schemas/txApi';
+import { GeneralTokenInfoSchema } from '../api/schemas/wallet';
+import WalletConnection from './connection';
+import NanoContractHeader from '../nano_contracts/header';
 
 const ERROR_MESSAGE_PIN_REQUIRED = 'Pin is required.';
 
-/**
- * TODO: This should be removed when this file is migrated to typescript
- * we need this here because the typescript enum from the Connection file is
- * not being correctly transpiled here, returning `undefined` for ConnectionState.CLOSED.
- */
-const ConnectionState = {
-  CLOSED: 0,
-  CONNECTING: 1,
-  CONNECTED: 2,
-};
+const ERROR_MESSAGE_PASSWORD_REQUIRED = 'Password is required.';
 
 /**
  * This is a Wallet that is supposed to be simple to be used by a third-party app.
@@ -170,7 +187,7 @@ class HathorWallet extends EventEmitter {
 
   logger: ILogger;
 
-  conn: Connection;
+  conn: WalletConnection;
 
   // Wallet state
   state: WalletState;
@@ -197,6 +214,8 @@ class HathorWallet extends EventEmitter {
   // Address management
   preCalculatedAddresses: string[] | null;
 
+  preCalculatedShieldedAddresses: IPrecalculatedShieldedAddress[] | null;
+
   // Connection state
   firstConnection: boolean;
 
@@ -210,7 +229,7 @@ class HathorWallet extends EventEmitter {
   multisig?: { pubkeys: string[]; numSignatures: number };
 
   // Transaction queue
-  wsTxQueue: Queue;
+  wsTxQueue: Queue<WalletWebSocketData>;
 
   newTxPromise: Promise<void>;
 
@@ -309,6 +328,7 @@ class HathorWallet extends EventEmitter {
       beforeReloadCallback = null,
       multisig = null,
       preCalculatedAddresses = null,
+      preCalculatedShieldedAddresses = null,
       scanPolicy = null,
       logger = null,
     }: HathorWalletConstructorParams = {} as HathorWalletConstructorParams
@@ -331,7 +351,7 @@ class HathorWallet extends EventEmitter {
       throw Error("You can't use xpriv with passphrase.");
     }
 
-    if (connection.state !== ConnectionState.CLOSED) {
+    if (connection.getState() !== ConnectionState.CLOSED) {
       throw Error("You can't share connections.");
     }
 
@@ -345,22 +365,13 @@ class HathorWallet extends EventEmitter {
 
     this.logger = logger || getDefaultLogger();
     if (storage) {
-      /**
-       * @type {import('../types').IStorage}
-       */
       this.storage = storage;
     } else {
       // Default to a memory store
       const store = new MemoryStore();
-      /**
-       * @type {import('../types').IStorage}
-       */
       this.storage = new Storage(store);
     }
     this.storage.setLogger(this.logger);
-    /**
-     * @type {import('./connection').default}
-     */
     this.conn = connection;
     this.conn.startControlHandlers(this.storage);
 
@@ -379,6 +390,7 @@ class HathorWallet extends EventEmitter {
     this.password = password;
 
     this.preCalculatedAddresses = preCalculatedAddresses;
+    this.preCalculatedShieldedAddresses = preCalculatedShieldedAddresses;
 
     this.onConnectionChangedState = this.onConnectionChangedState.bind(this);
     this.handleWebsocketMsg = this.handleWebsocketMsg.bind(this);
@@ -407,10 +419,15 @@ class HathorWallet extends EventEmitter {
       };
     }
 
-    this.wsTxQueue = new Queue();
+    this.wsTxQueue = new Queue<WalletWebSocketData>();
     this.newTxPromise = Promise.resolve();
 
-    this.scanPolicy = scanPolicy;
+    // Defaults to single address scanning policy
+    if (scanPolicy == null) {
+      this.scanPolicy = { policy: SCANNING_POLICY.SINGLE_ADDRESS };
+    } else {
+      this.scanPolicy = scanPolicy;
+    }
     this.isSignedExternally = this.storage.hasTxSignatureMethod();
 
     this.historySyncMode = HistorySyncMode.POLLING_HTTP_API;
@@ -467,6 +484,8 @@ class HathorWallet extends EventEmitter {
       minTxWeightCoefficient: versionData.min_tx_weight_coefficient,
       minTxWeightK: versionData.min_tx_weight_k,
       tokenDepositPercentage: versionData.token_deposit_percentage,
+      tokenDepositPercentageNumerator: versionData.token_deposit_percentage_numerator,
+      tokenDepositPercentageDenominator: versionData.token_deposit_percentage_denominator,
       rewardSpendMinBlocks: versionData.reward_spend_min_blocks,
       maxNumberInputs: versionData.max_number_inputs,
       maxNumberOutputs: versionData.max_number_outputs,
@@ -479,7 +498,7 @@ class HathorWallet extends EventEmitter {
    * @memberof HathorWallet
    * @inner
    * */
-  changeServer(newServer: string): void {
+  async changeServer(newServer: string): Promise<void> {
     this.storage.config.setServerUrl(newServer);
   }
 
@@ -612,9 +631,9 @@ class HathorWallet extends EventEmitter {
    * Called when the connection to the websocket changes.
    * It is also called if the network is down.
    *
-   * @param {Number} newState Enum of new state after change
+   * @param newState The new connection state (0: CLOSED, 1: CONNECTING, 2: CONNECTED)
    */
-  async onConnectionChangedState(newState: any): Promise<any> {
+  async onConnectionChangedState(newState: ConnectionState): Promise<void> {
     if (newState === ConnectionState.CONNECTED) {
       this.setState(HathorWallet.SYNCING);
 
@@ -624,8 +643,26 @@ class HathorWallet extends EventEmitter {
         // before loading the full data again
         if (this.firstConnection) {
           this.firstConnection = false;
-          const addressesToLoad: any = await scanPolicyStartAddresses(this.storage);
-          await this.syncHistory(addressesToLoad.nextIndex, addressesToLoad.count);
+          const scanPolicy = await this.storage.getScanningPolicy();
+          if (scanPolicy === SCANNING_POLICY.SINGLE_ADDRESS) {
+            try {
+              await this.enableSingleAddressMode();
+            } catch (err) {
+              if (err instanceof HasTxOutsideFirstAddressError) {
+                this.scanPolicy = { policy: SCANNING_POLICY.GAP_LIMIT, gapLimit: GAP_LIMIT };
+                await this.storage.setScanningPolicyData(this.scanPolicy);
+              } else {
+                throw err;
+              }
+            }
+          }
+          const addressesToLoad = await scanPolicyStartAddresses(this.storage);
+          await this.syncHistory(
+            addressesToLoad.nextIndex,
+            addressesToLoad.count,
+            false,
+            this.pinCode ?? undefined
+          );
         } else {
           if (this.beforeReloadCallback) {
             this.beforeReloadCallback();
@@ -633,7 +670,7 @@ class HathorWallet extends EventEmitter {
           await this.reloadStorage();
         }
         this.setState(HathorWallet.PROCESSING);
-      } catch (error: any) {
+      } catch (error) {
         this.setState(HathorWallet.ERROR);
         this.logger.error('Error loading wallet', { error });
       }
@@ -739,15 +776,20 @@ class HathorWallet extends EventEmitter {
    * @returns Address object with the count of txs for this address
    * @memberof HathorWallet
    * */
-  async *getAllAddresses(): AsyncGenerator<{
+  async *getAllAddresses(opts?: IAddressChainOptions): AsyncGenerator<{
     address: string;
     index: number;
     transactions: number;
   }> {
     // We add the count of transactions
     // in order to replicate the same return as the new
-    // wallet service facade
-    for await (const address of this.storage.getAllAddresses()) {
+    // wallet service facade.
+    //
+    // `opts.legacy` defaults to `true`; pass `legacy: false` to
+    // enumerate the shielded receive chain instead. The storage
+    // surface filters out the internal `shielded-spend` entries on
+    // either branch, so callers always get the user-facing shape.
+    for await (const address of this.storage.getAllAddresses(opts)) {
       yield {
         address: address.base58,
         index: address.bip32AddressIndex,
@@ -764,12 +806,23 @@ class HathorWallet extends EventEmitter {
    * @memberof HathorWallet
    */
   async hasTxOutsideFirstAddress(): Promise<boolean> {
-    for await (const address of this.storage.getAllAddresses()) {
-      if (address.bip32AddressIndex > 0 && address.numTransactions > 0) {
-        return true;
+    const addresses: string[] = [];
+    let foundAnyTx = false;
+    // Load address from index 1 to GAP_LIMIT
+    for (let i = 1; i < GAP_LIMIT; i++) {
+      const address = await this.getAddressAtIndex(i);
+      addresses.push(address);
+    }
+
+    for await (const gotTx of loadAddressHistory(addresses, this.storage, false)) {
+      if (gotTx) {
+        // This will signal we have found a transaction when syncing the history
+        foundAnyTx = true;
+        break;
       }
     }
-    return false;
+
+    return foundAnyTx;
   }
 
   /**
@@ -780,16 +833,29 @@ class HathorWallet extends EventEmitter {
    * @memberof HathorWallet
    * @inner
    */
-  async getAddressAtIndex(index: number): Promise<string> {
-    let address = await this.storage.getAddressAtIndex(index);
+  async getAddressAtIndex(index: number, opts?: IAddressChainOptions): Promise<string> {
+    let address = await this.storage.getAddressAtIndex(index, opts);
 
     if (address === null) {
+      // Derivation on a storage miss is a pure PEEK: the address is returned
+      // without being persisted. Persisting belongs to loadAddresses /
+      // scanAddressesToLoad, which manage the loaded window, its tracking
+      // cursors and the WS subscriptions coherently — saving here would leave
+      // holes in the window and claim ownership of an unwatched address.
+      if (opts?.legacy === false) {
+        // Shielded address not yet derived at this index
+        const result = await deriveShieldedAddressFromStorage(index, this.storage);
+        if (!result) {
+          throw new Error('Shielded keys not available');
+        }
+        return result.shieldedAddress.base58;
+      }
+      // Legacy address derivation
       if ((await this.storage.getWalletType()) === 'p2pkh') {
         address = await deriveAddressP2PKH(index, this.storage);
       } else {
         address = await deriveAddressP2SH(index, this.storage);
       }
-      await this.storage.saveAddress(address);
     }
     return address.base58;
   }
@@ -803,15 +869,20 @@ class HathorWallet extends EventEmitter {
    * @memberof HathorWallet
    * @inner
    */
-  async getAddressPathForIndex(index: number): Promise<string> {
-    const walletType = await this.storage.getWalletType();
-    if (walletType === WalletType.MULTISIG) {
+  async getAddressPathForIndex(index: number, opts?: IAddressChainOptions): Promise<string> {
+    let acctPath: string;
+    if (opts?.legacy === false) {
+      // Shielded addresses are formed by scanPubkey (account 1') + spendPubkey (account 2').
+      // We return the spend path since it's used for on-chain scripts and signing.
+      acctPath = SHIELDED_SPEND_ACCT_PATH;
+    } else if ((await this.storage.getWalletType()) === WalletType.MULTISIG) {
       // P2SH
-      return `${P2SH_ACCT_PATH}/0/${index}`;
+      acctPath = P2SH_ACCT_PATH;
+    } else {
+      // P2PKH
+      acctPath = P2PKH_ACCT_PATH;
     }
-
-    // P2PKH
-    return `${P2PKH_ACCT_PATH}/0/${index}`;
+    return `${acctPath}/0/${index}`;
   }
 
   /**
@@ -823,14 +894,18 @@ class HathorWallet extends EventEmitter {
    * @memberof HathorWallet
    * @inner
    */
-  async getCurrentAddress({ markAsUsed = false } = {}): Promise<{
+  async getCurrentAddress(
+    // eslint-disable-next-line default-param-last
+    { markAsUsed = false } = {},
+    opts?: IAddressChainOptions
+  ): Promise<{
     address: string;
     index: number | null;
     addressPath: string;
   }> {
-    const address = await this.storage.getCurrentAddress(markAsUsed);
+    const address = await this.storage.getCurrentAddress(markAsUsed, opts);
     const index = await this.getAddressIndex(address);
-    const addressPath = await this.getAddressPathForIndex(index!);
+    const addressPath = await this.getAddressPathForIndex(index!, opts);
 
     return { address, index, addressPath };
   }
@@ -838,16 +913,20 @@ class HathorWallet extends EventEmitter {
   /**
    * Get the next address after the current available
    */
-  async getNextAddress(): Promise<{ address: string; index: number | null; addressPath: string }> {
+  async getNextAddress(
+    opts?: IAddressChainOptions
+  ): Promise<{ address: string; index: number | null; addressPath: string }> {
     // First we mark the current address as used, then return the next
-    await this.getCurrentAddress({ markAsUsed: true });
-    return this.getCurrentAddress();
+    await this.getCurrentAddress({ markAsUsed: true }, opts);
+    return this.getCurrentAddress({}, opts);
   }
 
   /**
    * Called when a new message arrives from websocket.
+   *
+   * @param wsData WebSocket message data
    */
-  handleWebsocketMsg(wsData: any): any {
+  handleWebsocketMsg(wsData: WalletWebSocketData): void {
     if (wsData.type === 'wallet:address_history') {
       if (this.state !== HathorWallet.READY) {
         // Cannot process new transactions from ws when the wallet is not ready.
@@ -958,7 +1037,7 @@ class HathorWallet extends EventEmitter {
         break;
       }
       const txbalance = await this.getTxBalance(tx);
-      const txHistory = {
+      const txHistory: GetTxHistoryFullnodeFacadeReturnType = {
         txId: tx.tx_id,
         timestamp: tx.timestamp,
         voided: tx.is_voided,
@@ -969,6 +1048,15 @@ class HathorWallet extends EventEmitter {
         ncCaller: (tx.nc_address &&
           new Address(tx.nc_address, { network: this.getNetworkObject() })) as Address,
         firstBlock: tx.first_block as string | undefined,
+        // Pass-through fields needed by display layers that compute
+        // fees per-tx (network fee from FeeHeader entries, privacy
+        // fee from per-shielded-output mode). Cheap to copy and lets
+        // the consumer skip a second round-trip via `getTx`. Both are
+        // optional on `IHistoryTx`; spread-conditionally so the
+        // returned shape doesn't carry explicit `undefined` keys when
+        // the upstream payload didn't include them.
+        ...(tx.headers ? { headers: tx.headers } : {}),
+        ...(tx.shielded_outputs ? { shielded_outputs: tx.shielded_outputs } : {}),
       };
       if (tx.version === ON_CHAIN_BLUEPRINTS_VERSION) {
         txHistory.ncCaller = (tx.nc_pubkey &&
@@ -1005,6 +1093,99 @@ class HathorWallet extends EventEmitter {
    */
   async getTx(id: string): Promise<IHistoryTx | null> {
     return this.storage.getTx(id);
+  }
+
+  /**
+   * Get the unblinding factors for shielded outputs in a transaction.
+   *
+   * Returns one entry per shielded output **the wallet owns** (received +
+   * change). Outputs the wallet generated for other recipients are not in
+   * scope — even though the wallet knows their blinding factors at signing
+   * time, disclosing them would leak the recipient's amount/token to a third
+   * party. The same is true of any shielded output decoded with a different
+   * wallet's scan key.
+   *
+   * Each entry carries the on-chain absolute output index the explorer / a
+   * fullnode uses to identify the output (`len(transparent_outputs) +
+   * shielded_index`). The viewer can recompute the Pedersen commitment from
+   * `{value, token, vbf, abf?}` and confirm it matches the on-chain
+   * commitment at that index.
+   *
+   * SEPARATED model: shielded outputs live in `tx.shielded_outputs[]` (the
+   * full on-chain-ordered list); the wallet writes the owned-marker fields
+   * (`value`/`token`/`blindingFactor`/`assetBlindingFactor`) IN PLACE on the
+   * slots it decrypts. The single ownership gate is `value !== undefined`;
+   * the on-chain absolute index of `shielded_outputs[s]` is
+   * `tx.outputs.length + s`.
+   */
+  async getShieldedUnblindingForTx(
+    txId: string
+  ): Promise<{ outputs: ShieldedOpeningEntry[]; inputs: ShieldedOpeningEntry[] }> {
+    const tx = await this.storage.getTx(txId);
+    if (!tx) return { outputs: [], inputs: [] };
+
+    const ownedOutputsOf = (target: IHistoryTx): Map<number, ShieldedOpening> => {
+      // Build a lookup keyed by on-chain absolute output index for shielded
+      // outputs the wallet owns (decoded). Same shape used by both the outputs
+      // path (this tx's shielded_outputs) and the inputs path (each input's
+      // parent tx's shielded_outputs). The single ownership gate is the
+      // top-level `value !== undefined`: slots the fullnode delivered but the
+      // wallet couldn't decode never get the owned-marker fields written, so
+      // they are excluded here. `blindingFactor` must also be present to
+      // produce a usable opening.
+      const transparentCount = (target.outputs ?? []).length;
+      const out = new Map<number, ShieldedOpening>();
+      const shielded = target.shielded_outputs ?? [];
+      for (let s = 0; s < shielded.length; s += 1) {
+        const output = shielded[s];
+        if (output.value === undefined) continue;
+        if (!output.blindingFactor || output.token === undefined) continue;
+        const absIdx = transparentCount + s;
+        out.set(absIdx, {
+          value: output.value,
+          token: output.token,
+          vbf: output.blindingFactor,
+          ...(output.assetBlindingFactor ? { abf: output.assetBlindingFactor } : {}),
+        });
+      }
+      return out;
+    };
+
+    const outputsResult: ShieldedOpeningEntry[] = [];
+    for (const [absIdx, opening] of ownedOutputsOf(tx).entries()) {
+      outputsResult.push({ index: absIdx, ...opening });
+    }
+
+    // Inputs: a shielded input references a previous shielded output by
+    // `tx_id` + `index` (the parent's on-chain absolute index). If the wallet
+    // owned that previous output (its parent tx is in history with the
+    // owned-marker fields written on the slot), the same opening unblinds the
+    // input. Inputs whose parent the wallet doesn't own stay opaque — the
+    // wallet has no business disclosing someone else's blinding factors.
+    const inputsResult: ShieldedOpeningEntry[] = [];
+    const parentTxCache = new Map<string, Map<number, ShieldedOpening>>();
+    for (const [inputIdx, input] of (tx.inputs ?? []).entries()) {
+      // We don't gate on `input.type === 'shielded'`: the sender-local insert
+      // path builds the IHistoryTx without setting `type` on inputs that spend
+      // shielded parents. Instead attempt the parent-opening lookup on every
+      // input — only inputs whose parent tx has a decoded shielded entry at the
+      // referenced absolute index produce a hit, which is exactly the ownership
+      // gate we want. Transparent inputs naturally miss (parents have no
+      // shielded entry at that absolute index) and fall through.
+      const { tx_id: parentTxId, index: parentOutputIndex } = input;
+      if (!parentTxId || parentOutputIndex === undefined) continue;
+      let parentOwned = parentTxCache.get(parentTxId);
+      if (parentOwned === undefined) {
+        const parent = await this.storage.getTx(parentTxId);
+        parentOwned = parent ? ownedOutputsOf(parent) : new Map();
+        parentTxCache.set(parentTxId, parentOwned);
+      }
+      const opening = parentOwned.get(parentOutputIndex);
+      if (!opening) continue;
+      inputsResult.push({ index: inputIdx, ...opening });
+    }
+
+    return { outputs: outputsResult, inputs: inputsResult };
   }
 
   /**
@@ -1052,6 +1233,15 @@ class HathorWallet extends EventEmitter {
     const addressData = await this.storage.getAddressInfo(address);
     const index = addressData!.bip32AddressIndex;
 
+    // A user-facing shielded address is the 71-byte 'shielded' record, but its
+    // owned shielded outputs carry decoded.address = the spend-derived P2PKH
+    // (ctMappingAddress). Translate so the shielded accounting below matches —
+    // the same swap the store's selectUtxos filter does for getUtxos. A
+    // non-shielded query keeps `address` (a legacy address owns no shielded
+    // outputs anyway).
+    const shieldedMatchAddress =
+      addressData?.addressType === 'shielded' ? addressData.ctMappingAddress : address;
+
     // Address information that will be calculated below
     const addressInfo = {
       total_amount_received: 0n,
@@ -1062,6 +1252,11 @@ class HathorWallet extends EventEmitter {
       index,
     };
 
+    // Height-lock inputs are constant across the whole scan; read them once
+    // instead of per-output.
+    const nowHeight = await this.storage.getCurrentHeight();
+    const rewardLock = this.storage.version?.reward_spend_min_blocks;
+
     // Iterate through transactions
     for await (const tx of this.storage.txHistory()) {
       // Voided transactions should be ignored
@@ -1069,35 +1264,58 @@ class HathorWallet extends EventEmitter {
         continue;
       }
 
-      // Iterate through outputs
-      for (const output of tx.outputs) {
-        const is_address_valid = output.decoded && output.decoded.address === address;
-        const is_token_valid = token === output.token;
-        const is_authority = transactionUtils.isAuthorityOutput(output);
-        if (!is_address_valid || !is_token_valid || is_authority) {
-          continue;
-        }
+      // Shared per-output accounting for this address+token. hathor-core
+      // stamps `spent_by` and `decoded` on BOTH transparent and
+      // shielded outputs, so the two output kinds feed identical totals — only
+      // the field plumbing differs at the two call sites below.
+      const accrue = (
+        value: bigint,
+        decodedAddress: string | undefined,
+        outputToken: string,
+        // Absent on entries the wallet inserted locally (spent_by cannot be
+        // reconstructed there); the wire always stamps it (hex or null).
+        spentBy: string | null | undefined,
+        // Only `decoded` is consumed (timelock check) — passing the full
+        // output object at the call sites is fine.
+        lockable: Pick<HistoryTransactionOutput, 'decoded'>,
+        // The address decodedAddress must equal for this output to count: the
+        // query `address` for transparent outputs, the spend-P2PKH
+        // (ctMappingAddress) for shielded outputs.
+        matchAddress: string | undefined = address
+      ): void => {
+        if (decodedAddress !== matchAddress || token !== outputToken) return;
+        const is_spent = spentBy != null;
+        const is_locked =
+          transactionUtils.isOutputLocked(lockable) ||
+          transactionUtils.isHeightLocked(tx.height, nowHeight, rewardLock);
 
-        const is_spent = output.spent_by !== null;
-        const is_time_locked = transactionUtils.isOutputLocked(output);
-        // XXX: we currently do not check heightlock on the helper, checking here for compatibility
-        const nowHeight = await this.storage.getCurrentHeight();
-        const rewardLock = this.storage.version?.reward_spend_min_blocks;
-        const is_height_locked = transactionUtils.isHeightLocked(tx.height, nowHeight, rewardLock);
-        const is_locked = is_time_locked || is_height_locked;
-
-        addressInfo.total_amount_received += output.value;
-
+        addressInfo.total_amount_received += value;
         if (is_spent) {
-          addressInfo.total_amount_sent += output.value;
-          continue;
+          addressInfo.total_amount_sent += value;
+          return;
         }
-
         if (is_locked) {
-          addressInfo.total_amount_locked += output.value;
+          addressInfo.total_amount_locked += value;
         } else {
-          addressInfo.total_amount_available += output.value;
+          addressInfo.total_amount_available += value;
         }
+      };
+
+      // Transparent outputs — authority outputs never count toward value totals.
+      for (const output of tx.outputs) {
+        if (transactionUtils.isAuthorityOutput(output)) continue;
+        accrue(output.value, output.decoded?.address, output.token, output.spent_by, output);
+      }
+
+      // SEPARATED model: owned shielded outputs live in tx.shielded_outputs[]
+      // (value/token written in place after decryption), with decoded.address =
+      // the shielded-spend P2PKH. Only wallet-owned slots (value !== undefined)
+      // carry an opening; the rest are skipped.
+      for (const so of tx.shielded_outputs ?? []) {
+        if (so.value === undefined) continue; // not owned / not yet decrypted
+        // The `value` gate above proves the slot was decrypted, and decode
+        // writes value+token together — so `token` is always present here.
+        accrue(so.value, so.decoded?.address, so.token!, so.spent_by, so, shieldedMatchAddress);
       }
     }
 
@@ -1121,6 +1339,10 @@ class HathorWallet extends EventEmitter {
       amount_bigger_than: options.amount_bigger_than,
       max_amount: options.max_amount,
       only_available_utxos: options.only_available_utxos,
+      // Transparent-only by default: getUtxos feeds consolidateUtxos, which
+      // spends its results as TRANSPARENT inputs — a shielded UTXO leaking in
+      // would be mis-spent. Callers wanting shielded UTXOs opt in explicitly.
+      shielded: options.shielded ?? false,
     };
     const utxoDetails: UtxoDetails = {
       total_amount_available: 0n,
@@ -1170,8 +1392,18 @@ class HathorWallet extends EventEmitter {
    * @yields all available utxos
    */
   async *getAvailableUtxos(options: GetAvailableUtxosOptions = {}): AsyncGenerator<IUtxo> {
-    // This method only returns available utxos
-    for await (const utxo of this.storage.selectUtxos({ ...options, only_available_utxos: true })) {
+    // Defaults to transparent-only (shielded ?? false): the main consumer,
+    // getUtxosForAmount, feeds the tx-template interpreter and nano-contract
+    // deposit selection, which spend inputs as transparent and hard-fail on a
+    // shielded outpoint — so shielded must not leak into an unqualified call
+    // (the store returns both kinds when the flag is absent). A caller that
+    // explicitly wants shielded available UTXOs passes { shielded: true };
+    // shielded-aware spending uses bestUtxoSelection.
+    for await (const utxo of this.storage.selectUtxos({
+      ...options,
+      shielded: options.shielded ?? false,
+      only_available_utxos: true,
+    })) {
       const addressIndex = await this.getAddressIndex(utxo.address);
       const addressPath = await this.getAddressPathForIndex(addressIndex!);
       // XXX: selectUtxos is supposed to return IUtxos, but here we re-create the entire object.
@@ -1259,7 +1491,15 @@ class HathorWallet extends EventEmitter {
     utxos: UtxoDetails['utxos'];
     total_amount: bigint;
   }> {
-    const utxoDetails = await this.getUtxos({ ...options, only_available_utxos: true });
+    // Consolidation spends its selected UTXOs as transparent inputs, so a
+    // shielded UTXO must never be selected here (a SEPARATED-model shielded
+    // input index would fall past outputs.length). Force shielded:false even if
+    // a caller passes shielded:true — the literal after the spread wins.
+    const utxoDetails = await this.getUtxos({
+      ...options,
+      only_available_utxos: true,
+      shielded: false,
+    });
     const inputs: { txId: string; index: number; token: string }[] = [];
     const utxos: UtxoDetails['utxos'] = [];
     let total_amount = 0n;
@@ -1382,12 +1622,9 @@ class HathorWallet extends EventEmitter {
 
   /**
    * Process the transactions on the websocket transaction queue as if they just arrived.
-   *
-   * @memberof HathorWallet
-   * @inner
    */
-  async processTxQueue(): Promise<any> {
-    let wsData: any = this.wsTxQueue.dequeue();
+  async processTxQueue(): Promise<void> {
+    let wsData = this.wsTxQueue.dequeue();
 
     while (wsData !== undefined) {
       // save new txdata
@@ -1401,7 +1638,7 @@ class HathorWallet extends EventEmitter {
       });
     }
 
-    await this.storage.processHistory();
+    await this.storage.processHistory(this.pinCode ?? undefined);
   }
 
   /**
@@ -1414,17 +1651,22 @@ class HathorWallet extends EventEmitter {
     // check address scanning policy and load more addresses if needed
     const loadMoreAddresses = await checkScanningPolicy(this.storage);
     if (loadMoreAddresses !== null) {
-      await this.syncHistory(loadMoreAddresses.nextIndex, loadMoreAddresses.count, processHistory);
+      await this.syncHistory(
+        loadMoreAddresses.nextIndex,
+        loadMoreAddresses.count,
+        processHistory,
+        this.pinCode ?? undefined
+      );
     }
   }
 
   /**
    * Call the method to process data and resume with the correct state after processing.
    *
-   * @returns {Promise} A promise that resolves when the wallet is done processing the tx queue.
+   * @returns A promise that resolves when the wallet is done processing the tx queue.
    */
-  async onEnterStateProcessing() {
-    // Started processing state now, so we prepare the local data to support using this facade interchangable with wallet service facade in both wallets
+  async onEnterStateProcessing(): Promise<void> {
+    // Started processing state now, so we prepare the local data to support using this facade interchangeable with wallet service facade in both wallets
     try {
       await this.processTxQueue();
       this.setState(HathorWallet.READY);
@@ -1447,58 +1689,147 @@ class HathorWallet extends EventEmitter {
 
   /**
    * Enqueue the call for onNewTx with the given data.
-   * @param {{ history: import('../types').IHistoryTx }} wsData
+   *
+   * The `.catch` is load-bearing — without it, one rejection inside
+   * onNewTx (or any of its downstream awaits: `addTx`, `processNewTx`,
+   * the shielded decryption loop, `processHistory`, etc.) would leave
+   * `newTxPromise` in a rejected state, and every subsequent
+   * `.then(() => onNewTx(...))` would propagate the rejection without
+   * invoking the handler. The wallet would silently stop processing
+   * websocket events for the rest of the session. Logging the error and
+   * swallowing the rejection preserves the queue contract for follow-up
+   * messages while keeping the underlying failure visible.
+   *
+   * @param wsData WebSocket message data containing transaction history
+   * @param txPin Optional PIN for THIS message's shielded decryption. The
+   *   sender-local insert passes the pin it used for the send so a wallet
+   *   constructed without a stored `pinCode` (per-call-pin flow) still decodes
+   *   and credits its own shielded change. WebSocket-delivered messages omit it
+   *   and fall back to `this.pinCode`.
    */
-  enqueueOnNewTx(wsData) {
-    this.newTxPromise = this.newTxPromise.then(() => this.onNewTx(wsData));
+  enqueueOnNewTx(wsData: WalletWebSocketData, txPin?: string): void {
+    this.newTxPromise = this.newTxPromise
+      .then(() => this.onNewTx(wsData, txPin))
+      .catch(err => {
+        const txId = wsData?.history?.tx_id ?? '<unknown>';
+        this.logger.error(`enqueueOnNewTx: onNewTx failed for tx ${txId}: ${err?.stack ?? err}`);
+      });
   }
 
   /**
-   * @param {{ history: import('../types').IHistoryTx }} wsData
+   * Process a new transaction received from websocket.
+   *
+   * @param wsData WebSocket message data containing transaction history
+   * @param txPin Optional PIN for this tx's shielded decryption (see
+   *   enqueueOnNewTx); falls back to the wallet's stored `pinCode`.
    */
-  async onNewTx(wsData) {
+  async onNewTx(wsData: WalletWebSocketData, txPin?: string): Promise<void> {
     const parseResult = IHistoryTxSchema.safeParse(wsData.history);
     if (!parseResult.success) {
       this.logger.error(parseResult.error);
       return;
     }
     const newTx = parseResult.data;
-    // Later we will compare the storageTx and the received tx.
-    // To avoid reference issues we clone the current storageTx.
-    const storageTx = cloneDeep(await this.storage.getTx(newTx.tx_id));
+
+    // Normalize: convert the shielded outputs' base64 confidential fields to hex
+    // (the fullnode delivers them already separated in shielded_outputs[]).
+    transactionUtils.normalizeShieldedOutputs(newTx);
+
+    // SECURITY: strip the decode-only shielded fields the fullnode can never
+    // legitimately provide (a shielded output's value/token/blinding and a
+    // shielded input's echoed value/token/decoded). Ownership is re-established
+    // only from our own ECDH rewind (processNewTx) or, for a known tx, restored
+    // from our own storage inside storage.addTx. Honest deliveries carry these
+    // bare, so this is a no-op there. See transactionUtils for the rationale.
+    transactionUtils.clearUntrustedShieldedData(newTx);
+
+    // Bail before touching storage if the wallet was already stopped. stop()
+    // sets walletStopped synchronously as its first statement (before the
+    // awaited storage wipe), so this entry check wins the race — the addTx
+    // below cannot resurrect a tx into a just-cleaned store.
+    if (this.walletStopped) {
+      return;
+    }
+
+    const storageTx = await this.storage.getTx(newTx.tx_id);
     const isNewTx = storageTx === null;
 
     newTx.processingStatus = TxHistoryProcessingStatus.PROCESSING;
 
+    // storage.addTx restores the wallet's decoded shielded data (stripped above)
+    // from the previously-stored copy before persisting, so a bare re-delivery
+    // never clobbers the decoded balance.
     await this.storage.addTx(newTx);
     await this.scanAddressesToLoad();
+
+    // Prefer the per-message pin (sender-local insert) so a wallet with no
+    // stored pinCode still decrypts its own shielded change; fall back to the
+    // stored pin for WebSocket-delivered txs.
+    const pin = txPin ?? this.pinCode ?? undefined;
 
     // set state to processing and save current state.
     const previousState = this.state;
     this.state = HathorWallet.PROCESSING;
-    if (isNewTx) {
-      // Process this single transaction.
-      // Handling new metadatas and deleting utxos that are not available anymore
-      await this.storage.processNewTx(newTx);
-    } else if (storageTx.is_voided !== newTx.is_voided) {
-      // This is a voided transaction update event.
-      // voided transactions require a full history reprocess.
-      await this.storage.processHistory();
-    } else if (!newTx.is_voided) {
-      // Process other types of metadata updates.
-      await processMetadataChanged(this.storage, newTx);
-    }
-    // restore previous state
-    this.state = previousState;
+    try {
+      if (isNewTx) {
+        // Process this single transaction.
+        // Handling new metadatas and deleting utxos that are not available anymore
+        await this.storage.processNewTx(newTx, pin);
+      } else if (storageTx.is_voided !== newTx.is_voided) {
+        // Voided flag changed — a full history reprocess is required to avoid
+        // double-counting from the prior processNewTx.
+        await this.storage.processHistory(pin);
+      } else if (!newTx.is_voided) {
+        // Process other types of metadata updates.
+        await processMetadataChanged(this.storage, newTx);
+      }
 
-    newTx.processingStatus = TxHistoryProcessingStatus.FINISHED;
-    // Save the transaction in the storage
-    await this.storage.addTx(newTx);
+      // If the wallet was stopped while this tx was mid-processing (a concurrent
+      // stop()/logout, possibly with cleanStorage), bail before the final save
+      // and emit: re-inserting the tx would resurrect it — including any decoded
+      // shielded value/blinding restored above — into the storage the user just
+      // wiped, and 'update-tx'/'new-tx' would fire on a closed wallet.
+      if (this.walletStopped) {
+        return;
+      }
 
-    if (isNewTx) {
-      this.emit('new-tx', newTx);
-    } else {
-      this.emit('update-tx', newTx);
+      // restore previous state before the final save/emit
+      this.state = previousState;
+
+      // Flip PROCESSING -> FINISHED. The tx was deliberately saved as PROCESSING
+      // before the branches above so a crash mid-processing is detectable; this
+      // final save publishes the flag. It re-reads the PERSISTED tx (not the
+      // in-scope `newTx`) because storage holds the authoritative
+      // post-processing state — decode markers written in place, enriched
+      // inputs — and after a processHistory branch the local object is stale.
+      // The addTx round-trip also pushes the in-place decode mutations through
+      // an explicit store.saveTx instead of relying on object aliasing.
+      const persisted = await this.storage.getTx(newTx.tx_id);
+      // If the tx vanished under us — a concurrent stop({cleanStorage}) wiped
+      // the store between the walletStopped guard above and this read — do NOT
+      // resurrect it. Re-saving the in-scope `newTx` would re-insert a
+      // value-less (undecoded, wire-form) tx into the cleaned store; a restart
+      // re-adds it correctly from the fullnode.
+      if (!persisted) {
+        return;
+      }
+      persisted.processingStatus = TxHistoryProcessingStatus.FINISHED;
+      await this.storage.addTx(persisted);
+
+      if (isNewTx) {
+        this.emit('new-tx', persisted);
+      } else {
+        this.emit('update-tx', persisted);
+      }
+    } finally {
+      // Safety net: if the block above threw before restoring the state (the
+      // enqueueOnNewTx .catch then logs+swallows it), un-stick it here.
+      // Otherwise the wallet stays at PROCESSING forever and handleWebsocketMsg
+      // parks every later WS tx in wsTxQueue with nothing to drain it. A
+      // deliberate CLOSED from a concurrent stop() is left untouched.
+      if (this.state === HathorWallet.PROCESSING && !this.walletStopped) {
+        this.state = previousState;
+      }
     }
   }
 
@@ -1609,29 +1940,25 @@ class HathorWallet extends EventEmitter {
   /**
    * Connect to the server and start emitting events.
    *
-   * @param {Object} optionsParams Options parameters
-   *  {
-   *   'pinCode': pin to decrypt xpriv information. Required if not set in object.
-   *   'password': password to decrypt xpriv information. Required if not set in object.
-   *  }
+   * @param optionsParams Options parameters for starting the wallet
    */
-  async start(optionsParams: any = {}): Promise<ApiVersion> {
-    const options: any = { pinCode: null, password: null, ...optionsParams };
-    const pinCode: any = options.pinCode || this.pinCode;
-    const password: any = options.password || this.password;
+  async start(optionsParams: WalletStartOptions = {}): Promise<ApiVersion> {
+    const options = { pinCode: null, password: null, ...optionsParams };
+    const pinCode = options.pinCode || this.pinCode;
+    const password = options.password || this.password;
     if (!this.xpub && !pinCode) {
       throw new Error(ERROR_MESSAGE_PIN_REQUIRED);
     }
 
     if (this.seed && !password) {
-      throw new Error('Password is required.');
+      throw new Error(ERROR_MESSAGE_PASSWORD_REQUIRED);
     }
 
     // Check database consistency
     await this.storage.store.validate();
     await this.storage.setScanningPolicyData(this.scanPolicy || null);
 
-    this.storage.config.setNetwork(this.conn.network);
+    this.storage.config.setNetwork(this.conn.getCurrentNetwork());
     this.storage.config.setServerUrl(this.conn.getCurrentServer());
     this.conn.on('state', this.onConnectionChangedState);
     this.conn.on('wallet-update', this.handleWebsocketMsg);
@@ -1645,17 +1972,32 @@ class HathorWallet extends EventEmitter {
       }
     }
 
+    if (this.preCalculatedShieldedAddresses) {
+      // Mirrors the legacy injection above: pre-populates the shielded chain so
+      // loadAddresses skips the per-index EC derivation for these indexes.
+      await savePrecalculatedShieldedAddresses(this.storage, this.preCalculatedShieldedAddresses);
+    }
+
     let accessData = await this.storage.getAccessData();
     if (!accessData) {
       if (this.seed) {
+        if (!pinCode) {
+          throw new Error(ERROR_MESSAGE_PIN_REQUIRED);
+        }
+        if (!password) {
+          throw new Error(ERROR_MESSAGE_PASSWORD_REQUIRED);
+        }
         accessData = walletUtils.generateAccessDataFromSeed(this.seed, {
           multisig: this.multisig,
           passphrase: this.passphrase,
           pin: pinCode,
           password,
-          networkName: this.conn.network,
+          networkName: this.conn.getCurrentNetwork(),
         });
       } else if (this.xpriv) {
+        if (!pinCode) {
+          throw new Error(ERROR_MESSAGE_PIN_REQUIRED);
+        }
         accessData = walletUtils.generateAccessDataFromXpriv(this.xpriv, {
           multisig: this.multisig,
           pin: pinCode,
@@ -1668,6 +2010,20 @@ class HathorWallet extends EventEmitter {
         throw new Error('This should never happen');
       }
       await this.storage.saveAccessData(accessData);
+    } else if (pinCode && password) {
+      // Existing wallet — migrate forward if the persisted record predates
+      // shielded support. `migrateShieldedAccessData` is idempotent and a
+      // no-op for xpub-only wallets (nothing to derive from). We only persist
+      // when fields were actually written.
+      const migrated = walletUtils.migrateShieldedAccessData(accessData, {
+        pin: pinCode,
+        password,
+        passphrase: this.passphrase,
+        networkName: this.conn.getCurrentNetwork(),
+      });
+      if (migrated) {
+        await this.storage.saveAccessData(accessData);
+      }
     }
 
     this.clearSensitiveData();
@@ -1678,21 +2034,40 @@ class HathorWallet extends EventEmitter {
     const info = await new Promise<ApiVersion>((resolve, reject) => {
       versionApi.getVersion(resolve).catch(error => reject(error));
     });
-    if (info.network.indexOf(this.conn.network) >= 0) {
+    if (info.network.indexOf(this.conn.getCurrentNetwork()) >= 0) {
       this.storage.setApiVersion(info);
       await this.storage.saveNativeToken();
+
+      // Note: shielded crypto provider is not auto-detected. Clients that need
+      // shielded support MUST install the appropriate crypto package
+      // (@hathor/ct-crypto-node for Node, @hathor/ct-crypto-wasm for browser
+      // verifier-only) and register the provider explicitly via
+      // `wallet.setShieldedCryptoProvider(...)` before starting the wallet.
+
       this.conn.start();
     } else {
       this.setState(HathorWallet.CLOSED);
-      throw new Error(`Wrong network. server=${info.network} expected=${this.conn.network}`);
+      throw new Error(
+        `Wrong network. server=${info.network} expected=${this.conn.getCurrentNetwork()}`
+      );
     }
     return info;
   }
 
   /**
    * Close the connections and stop emitting events.
+   *
+   * @param options Options for stopping the wallet
    */
-  async stop({ cleanStorage = true, cleanAddresses = false, cleanTokens = false } = {}) {
+  async stop({
+    cleanStorage = true,
+    cleanAddresses = false,
+    cleanTokens = false,
+  }: WalletStopOptions = {}): Promise<void> {
+    // Set synchronously, BEFORE the awaited handleStop() wipe, so an in-flight
+    // onNewTx cannot pass its walletStopped guard during the wipe and resurrect
+    // a tx (with decoded shielded secrets) into the just-cleaned storage.
+    this.walletStopped = true;
     this.setState(HathorWallet.CLOSED);
     this.removeAllListeners();
 
@@ -1704,7 +2079,6 @@ class HathorWallet extends EventEmitter {
     });
 
     this.firstConnection = true;
-    this.walletStopped = true;
     this.conn.stop();
   }
 
@@ -2506,8 +2880,42 @@ class HathorWallet extends EventEmitter {
     };
   }
 
-  isReady() {
+  isReady(): boolean {
     return this.state === HathorWallet.READY;
+  }
+
+  /**
+   * HTR deposit required to mint the given amount of a deposit-based token.
+   *
+   * The deposit percentage is read from the connected fullnode's `/version` data,
+   * so callers pass only the amount. Requires the wallet to be READY.
+   *
+   * @memberof HathorWallet
+   * @inner
+   */
+  getDepositAmount(mintAmount: OutputValueType): OutputValueType {
+    if (!this.isReady()) {
+      throw new WalletError('Wallet not ready');
+    }
+    const { numerator, denominator } = this.storage.getTokenDepositPercentageFraction();
+    return tokenUtils.getDepositAmount(mintAmount, numerator, denominator);
+  }
+
+  /**
+   * HTR withdrawal returned when melting the given amount of a deposit-based token.
+   *
+   * The deposit percentage is read from the connected fullnode's `/version` data,
+   * so callers pass only the amount. Requires the wallet to be READY.
+   *
+   * @memberof HathorWallet
+   * @inner
+   */
+  getWithdrawAmount(meltAmount: OutputValueType): OutputValueType {
+    if (!this.isReady()) {
+      throw new WalletError('Wallet not ready');
+    }
+    const { numerator, denominator } = this.storage.getTokenDepositPercentageFraction();
+    return tokenUtils.getWithdrawAmount(meltAmount, numerator, denominator);
   }
 
   /**
@@ -2594,6 +3002,16 @@ class HathorWallet extends EventEmitter {
         addresses.add(io.decoded.address);
       }
     }
+    // SEPARATED model: a shielded output the wallet owns lives in
+    // tx.shielded_outputs[], not tx.outputs[]; its decoded.address is the
+    // wallet's on-chain spend-derived P2PKH. Without this a shielded-only
+    // receive returns an empty/incomplete address set. decoded.address is
+    // on-wire so this works regardless of decryption state.
+    for (const so of tx.shielded_outputs ?? []) {
+      if (so.decoded?.address && (await this.isAddressMine(so.decoded.address))) {
+        addresses.add(so.decoded.address);
+      }
+    }
 
     return addresses;
   }
@@ -2668,9 +3086,16 @@ class HathorWallet extends EventEmitter {
     const walletInputs: IWalletInputInfo[] = [];
 
     for await (const { tx: spentTx, input, index } of this.storage.getSpentTxs(tx.inputs)) {
-      const addressInfo = await this.storage.getAddressInfo(
-        spentTx.outputs[input.index].decoded.address!
-      );
+      // SEPARATED model: a shielded input's on-chain index is >= outputs.length,
+      // so a positional `spentTx.outputs[input.index]` read is undefined and
+      // throws. Resolve arithmetically (mirrors getSignatureForTx); the
+      // spend-derived decoded.address is on the wire for every output.
+      const resolved = transactionUtils.resolveSpentOutput(spentTx, input.index);
+      const spentAddress = resolved?.output?.decoded?.address;
+      if (!spentAddress) {
+        continue;
+      }
+      const addressInfo = await this.storage.getAddressInfo(spentAddress);
       if (addressInfo === null) {
         continue;
       }
@@ -2720,36 +3145,38 @@ class HathorWallet extends EventEmitter {
 
   /**
    * Sign all inputs of the given transaction.
-   * OBS: only for P2PKH wallets.
    *
    * @param tx - The transaction to be signed
    * @param options - Options for signing
-   * @param options.pinCode - PIN to decrypt the private key. Optional but required if not set in this
+   * @param options.pinCode - PIN to decrypt the private key
    *
    * @returns The signed transaction
    */
   async signTx(tx: Transaction, options: { pinCode?: string | null } = {}): Promise<Transaction> {
-    for (const sigInfo of await this.getSignatures(tx, options)) {
-      const { signature, pubkey, inputIndex } = sigInfo;
-      const inputData = transactionUtils.createInputData(
-        Buffer.from(signature, 'hex'),
-        Buffer.from(pubkey, 'hex')
-      );
-      tx.inputs[inputIndex].setData(inputData);
+    if (await this.isReadonly()) {
+      throw new WalletFromXPubGuard('signTx');
+    }
+    const pinCode = options.pinCode ?? this.pinCode;
+    // The pin is only used to decrypt the local private key. When an external tx-signing
+    // method is registered (e.g. a hardware or passkey signer), signatures are produced
+    // without it, so the pin is optional in that case.
+    if (!pinCode && !this.storage.hasTxSignatureMethod()) {
+      throw new Error('Pin code is required to sign a transaction');
     }
 
-    return tx;
+    const signedTx = await transactionUtils.signTransaction(tx, this.storage, pinCode ?? '');
+    signedTx.prepareToSend(transactionUtils.getWeightConstantsFromStorage(this.storage));
+    return signedTx;
   }
 
   /**
    * Guard to check if the response is a transaction not found response
    *
-   * @param {Object} data The request response data
-   *
-   * @throws {TxNotFoundError} If the returned error was a transaction not found
+   * @param data The request response data
+   * @throws TxNotFoundError if the returned error was a transaction not found
    */
-  static _txNotFoundGuard(data: any): any {
-    if (get(data, 'message', '') === 'Transaction not found') {
+  static _txNotFoundGuard(data: unknown): void {
+    if ((get(data, 'message', '') as string) === 'Transaction not found') {
       throw new TxNotFoundError();
     }
   }
@@ -2820,7 +3247,7 @@ class HathorWallet extends EventEmitter {
     graphType: string,
     maxLevel: number
   ): Promise<GraphvizNeighboursDotResponse> {
-    const graphvizData: GraphvizNeighboursResponse = await new Promise<unknown>(
+    const graphvizData: GraphvizNeighboursResponse = await new Promise<GraphvizNeighboursResponse>(
       (resolve, reject) => {
         txApi
           .getGraphvizNeighbors(txId, graphType, maxLevel, resolve)
@@ -2914,14 +3341,42 @@ class HathorWallet extends EventEmitter {
       throw new Error(`Failed to get transaction ${txId}: ${fullTx.message}`);
     }
 
+    // Shielded outputs are never delivered inline in outputs[] (they arrive in
+    // the dedicated shielded_outputs[] field), so every wire output here is
+    // transparent and can be hydrated. Shielded inputs, however, may arrive bare
+    // (commitment only) and lack the token_data hydrateWithTokenUid needs, so
+    // those are skipped.
     fullTx.tx.outputs = fullTx.tx.outputs.map(output =>
       hydrateWithTokenUid(output, fullTx.tx.tokens)
     );
-    fullTx.tx.inputs = fullTx.tx.inputs.map(input => hydrateWithTokenUid(input, fullTx.tx.tokens));
+    // Inputs can include a bare shielded input (no transparent token_data) — skip
+    // it; getTxBalance recovers its value/token from the parent shielded output.
+    fullTx.tx.inputs = fullTx.tx.inputs.map(input =>
+      transactionUtils.isShieldedInputEntry(input as { type?: string })
+        ? input
+        : hydrateWithTokenUid(input as { token_data: number }, fullTx.tx.tokens)
+    ) as typeof fullTx.tx.inputs;
+
+    // Prefer the locally-decoded tx for the balance. A fresh fullnode fetch
+    // carries shielded_outputs WITHOUT their decrypted value/token (the wallet's
+    // ECDH-recovered plaintext lives only in local storage), so getTxBalance
+    // over the wire copy credits 0 for owned shielded outputs and could even
+    // throw "no balance" for a shielded-only receive. Fall back to the
+    // (normalized) wire copy only when the tx isn't in our local history.
+    const localTx = await this.storage.getTx(txId);
+    let balanceTx: IHistoryTx;
+    if (localTx) {
+      balanceTx = localTx;
+    } else {
+      // Normalize the shielded outputs' base64 confidential fields to hex
+      // (getTxBalance reads off the separated shielded_outputs[] array).
+      transactionUtils.normalizeShieldedOutputs(fullTx.tx as unknown as IHistoryTx);
+      balanceTx = fullTx.tx as unknown as IHistoryTx;
+    }
 
     // Get the balance of each token in the transaction that belongs to this wallet
     // sample output: { 'A': 100, 'B': 10 }, where 'A' and 'B' are token UIDs
-    const tokenBalances = await this.getTxBalance(fullTx.tx as unknown as IHistoryTx);
+    const tokenBalances = await this.getTxBalance(balanceTx);
     const { length: hasBalance } = Object.keys(tokenBalances);
     if (!hasBalance) {
       throw new Error(`Transaction ${txId} does not have any balance for this wallet`);
@@ -2999,71 +3454,53 @@ class HathorWallet extends EventEmitter {
   }
 
   /**
-   * @typedef {Object} CreateNanoTxOptions
-   * @property {string?} [pinCode] PIN to decrypt the private key.
-   */
-
-  /**
-   * @typedef {Object} CreateNanoTxData
-   * @property {string?} [blueprintId=null] ID of the blueprint to create the nano contract. Required if method is initialize.
-   * @property {string?} [ncId=null] ID of the nano contract to execute method. Required if method is not initialize
-   * @property {NanoContractAction[]?} [actions] List of actions to execute in the nano contract transaction
-   * @property {any[]} [args] List of arguments for the method to be executed in the transaction
-   *
-   */
-
-  /**
    * Create and send a Transaction with nano header
    *
-   * @param {string} method Method of nano contract to have the transaction created
-   * @param {string} address Address that will be used to sign the nano contract transaction
-   * @param {CreateNanoTxData} [data]
-   * @param {CreateNanoTxOptions} [options]
-   *
-   * @returns {Promise<Transaction>}
+   * @param method Method of nano contract to have the transaction created
+   * @param address Address that will be used to sign the nano contract transaction
+   * @param data Data for the nano contract transaction
+   * @param options Options for the nano contract transaction
    */
   async createAndSendNanoContractTransaction(
-    method: any,
-    address: any,
-    data: any,
-    options: any = {}
-  ): Promise<any> {
-    const sendTransaction: any = await this.createNanoContractTransaction(
-      method,
-      address,
-      data,
-      options
-    );
+    method: string,
+    address: string,
+    data: FullnodeCreateNanoTxData,
+    options: Omit<CreateNanoTxOptions, 'signTx'> = {}
+  ): Promise<Transaction | null> {
+    const sendTransaction = await this.createNanoContractTransaction(method, address, data, {
+      ...options,
+      signTx: true,
+    });
     return sendTransaction.runFromMining();
   }
 
   /**
    * Create a Transaction with nano header and return the SendTransaction object
    *
-   * @param {string} method Method of nano contract to have the transaction created
-   * @param {string} address Address that will be used to sign the nano contract transaction
-   * @param {CreateNanoTxData} [data]
-   * @param {CreateNanoTxOptions} [options]
-   *
-   * @returns {Promise<SendTransaction>}
+   * @param method Method of nano contract to have the transaction created
+   * @param address Address that will be used to sign the nano contract transaction
+   * @param data Data for the nano contract transaction
+   * @param options Options for the nano contract transaction
    */
   async createNanoContractTransaction(
-    method: any,
-    address: any,
-    data: any,
-    options: any = {}
-  ): Promise<any> {
+    method: string,
+    address: string,
+    data: FullnodeCreateNanoTxData,
+    options: CreateNanoTxOptions = {}
+  ): Promise<SendTransaction> {
     if (await this.storage.isReadonly()) {
       throw new WalletFromXPubGuard('createNanoContractTransaction');
     }
-    const newOptions: any = { pinCode: null, ...options };
-    const pin: any = newOptions.pinCode || this.pinCode;
-    if (!pin) {
+    const newOptions = { pinCode: null, signTx: true, ...options };
+    const pin = newOptions.pinCode || this.pinCode;
+
+    // Only require PIN if we're actually signing
+    if (newOptions.signTx !== false && !pin) {
       throw new PinRequiredError(ERROR_MESSAGE_PIN_REQUIRED);
     }
 
     // Get caller pubkey
-    const addressInfo: any = await this.storage.getAddressInfo(address);
+    const addressInfo = await this.storage.getAddressInfo(address);
     if (!addressInfo) {
       throw new NanoContractTransactionError(
         `Address used to sign the transaction (${address}) does not belong to the wallet.`
@@ -3071,58 +3508,54 @@ class HathorWallet extends EventEmitter {
     }
 
     // Build and send transaction
-    const builder: any = new NanoContractTransactionBuilder()
+    const builder = new NanoContractTransactionBuilder()
       .setMethod(method)
       .setWallet(this)
-      .setBlueprintId(data.blueprintId)
-      .setNcId(data.ncId)
+      .setBlueprintId(data.blueprintId!)
+      .setNcId(data.ncId!)
       .setCaller(new Address(address, { network: this.getNetworkObject() }))
       .setActions(data.actions)
-      .setArgs(data.args)
+      .setArgs(data.args!)
       .setVertexType(NanoContractVertexType.TRANSACTION);
 
-    const nc: any = await builder.build();
-    return prepareNanoSendTransaction(nc, pin, this.storage);
-  }
+    // Set max fee if declared
+    if (newOptions.maxFee !== undefined) {
+      builder.setMaxFee(newOptions.maxFee);
+    }
 
-  /**
-   * @typedef {Object} CreateTokenTxOptions
-   * @property {string} [name] Token name
-   * @property {string} [symbol] Token symbol
-   * @property {OutputValueType} [amount] Token mint amount
-   * @property {boolean} [contractPaysTokenDeposit] If the contract will pay for the token deposit fee
-   * @property {string?} [mintAddress] Address to send the minted tokens
-   * @property {string?} [changeAddress] Change address to send change values
-   * @property {boolean?} [createMint] If should create a mint authority output
-   * @property {string?} [mintAuthorityAddress] The address to send the mint authority output to
-   * @property {boolean?} [allowExternalMintAuthorityAddress] If should accept an external mint authority address
-   * @property {boolean?} [createMelt] If should create a melt authority output
-   * @property {string?} [meltAuthorityAddress] The address to send the melt authority output to
-   * @property {boolean?} [allowExternalMeltAuthorityAddress] If should accept an external melt authority address
-   * @property {string[]?} [data] List of data strings to create data outputs
-   * @property {boolean?} [isCreateNFT] If this token is an NFT
-   */
+    // Set contract pays fees if declared
+    if (newOptions.contractPaysFees !== undefined) {
+      builder.setContractPaysFees(newOptions.contractPaysFees);
+    }
+
+    const nc = await builder.build();
+    if (newOptions.signTx !== false) {
+      return prepareNanoSendTransaction(nc, pin!, this.storage);
+    }
+
+    return new SendTransaction({
+      storage: this.storage,
+      transaction: nc,
+    });
+  }
 
   /**
    * Create and send a Create Token Transaction with nano header
    *
-   * @param {string} method Method of nano contract to have the transaction created
-   * @param {string} address Address that will be used to sign the nano contract transaction
-   * @param {CreateNanoTxData} [data]
-   * @param {CreateNanoTxData} [data]
-   * @param {CreateTokenTxOptions} [createTokenOptions]
-   * @param {CreateNanoTxOptions} [options]
-   *
-   * @returns {Promise<Transaction>}
+   * @param method Method of nano contract to have the transaction created
+   * @param address Address that will be used to sign the nano contract transaction
+   * @param data Data for the nano contract transaction
+   * @param createTokenOptions Options for the create token transaction
+   * @param options Options for the nano contract transaction
    */
   async createAndSendNanoContractCreateTokenTransaction(
-    method: any,
-    address: any,
-    data: any,
-    createTokenOptions: any,
-    options: any = {}
-  ): Promise<any> {
-    const sendTransaction: any = await this.createNanoContractCreateTokenTransaction(
+    method: string,
+    address: string,
+    data: FullnodeCreateNanoTxData,
+    createTokenOptions: CreateNanoTokenTxOptions,
+    options: CreateNanoTxOptions = {}
+  ): Promise<Transaction | null> {
+    const sendTransaction = await this.createNanoContractCreateTokenTransaction(
       method,
       address,
       data,
@@ -3135,31 +3568,29 @@ class HathorWallet extends EventEmitter {
   /**
    * Create a Create Token Transaction with nano header and return the SendTransaction object
    *
-   * @param {string} method Method of nano contract to have the transaction created
-   * @param {string} address Address that will be used to sign the nano contract transaction
-   * @param {CreateNanoTxData} [data]
-   * @param {CreateTokenTxOptions} [createTokenOptions]
-   * @param {CreateNanoTxOptions} [options]
-   *
-   * @returns {Promise<SendTransaction>}
+   * @param method Method of nano contract to have the transaction created
+   * @param address Address that will be used to sign the nano contract transaction
+   * @param data Data for the nano contract transaction
+   * @param createTokenOptions Options for the create token transaction
+   * @param options Options for the nano contract transaction
    */
   async createNanoContractCreateTokenTransaction(
-    method: any,
-    address: any,
-    data: any,
-    createTokenOptions: any,
-    options: any = {}
-  ): Promise<any> {
+    method: string,
+    address: string,
+    data: FullnodeCreateNanoTxData,
+    createTokenOptions: CreateNanoTokenTxOptions,
+    options: CreateNanoTxOptions = {}
+  ): Promise<SendTransaction> {
     if (await this.storage.isReadonly()) {
       throw new WalletFromXPubGuard('createNanoContractCreateTokenTransaction');
     }
-    const newOptions: any = { pinCode: null, ...options };
-    const pin: any = newOptions.pinCode || this.pinCode;
+    const newOptions = { pinCode: null, signTx: true, ...options };
+    const pin = newOptions.pinCode || this.pinCode;
     if (!pin) {
       throw new PinRequiredError(ERROR_MESSAGE_PIN_REQUIRED);
     }
 
-    const newCreateTokenOptions: any = {
+    const newCreateTokenOptions = {
       mintAddress: null,
       changeAddress: null,
       createMint: true,
@@ -3170,6 +3601,7 @@ class HathorWallet extends EventEmitter {
       allowExternalMeltAuthorityAddress: false,
       data: null,
       isCreateNFT: false,
+      tokenVersion: TokenVersion.DEPOSIT,
       ...createTokenOptions,
     };
 
@@ -3178,9 +3610,7 @@ class HathorWallet extends EventEmitter {
       !newCreateTokenOptions.allowExternalMintAuthorityAddress
     ) {
       // Validate that the mint authority address belongs to the wallet
-      const isAddressMine: any = await this.isAddressMine(
-        newCreateTokenOptions.mintAuthorityAddress
-      );
+      const isAddressMine = await this.isAddressMine(newCreateTokenOptions.mintAuthorityAddress);
       if (!isAddressMine) {
         throw new NanoContractTransactionError(
           'The mint authority address must belong to your wallet.'
@@ -3193,9 +3623,7 @@ class HathorWallet extends EventEmitter {
       !newCreateTokenOptions.allowExternalMeltAuthorityAddress
     ) {
       // Validate that the melt authority address belongs to the wallet
-      const isAddressMine: any = await this.isAddressMine(
-        newCreateTokenOptions.meltAuthorityAddress
-      );
+      const isAddressMine = await this.isAddressMine(newCreateTokenOptions.meltAuthorityAddress);
       if (!isAddressMine) {
         throw new NanoContractTransactionError(
           'The melt authority address must belong to your wallet.'
@@ -3207,25 +3635,44 @@ class HathorWallet extends EventEmitter {
       newCreateTokenOptions.mintAddress || (await this.getCurrentAddress()).address;
 
     // Get caller pubkey
-    const addressInfo: any = await this.storage.getAddressInfo(address);
+    const addressInfo = await this.storage.getAddressInfo(address);
     if (!addressInfo) {
       throw new NanoContractTransactionError(
         `Address used to sign the transaction (${address}) does not belong to the wallet.`
       );
     }
     // Build and send transaction
-    const builder: any = new NanoContractTransactionBuilder()
+    const builder = new NanoContractTransactionBuilder()
       .setMethod(method)
       .setWallet(this)
-      .setBlueprintId(data.blueprintId)
-      .setNcId(data.ncId)
+      .setBlueprintId(data.blueprintId!)
+      .setNcId(data.ncId!)
       .setCaller(new Address(address, { network: this.getNetworkObject() }))
       .setActions(data.actions)
-      .setArgs(data.args)
-      .setVertexType(NanoContractVertexType.CREATE_TOKEN_TRANSACTION, newCreateTokenOptions);
+      .setArgs(data.args!)
+      .setVertexType(
+        NanoContractVertexType.CREATE_TOKEN_TRANSACTION,
+        newCreateTokenOptions as NanoContractBuilderCreateTokenOptions
+      );
 
-    const nc: any = await builder.build();
-    return prepareNanoSendTransaction(nc, pin, this.storage);
+    // Set max fee if declared
+    if (newOptions.maxFee !== undefined) {
+      builder.setMaxFee(newOptions.maxFee);
+    }
+
+    // Set contract pays fees if declared
+    if (newOptions.contractPaysFees !== undefined) {
+      builder.setContractPaysFees(newOptions.contractPaysFees);
+    }
+
+    const nc = await builder.build();
+    if (newOptions.signTx !== false) {
+      return prepareNanoSendTransaction(nc, pin, this.storage);
+    }
+    return new SendTransaction({
+      storage: this.storage,
+      transaction: nc,
+    });
   }
 
   /**
@@ -3260,32 +3707,50 @@ class HathorWallet extends EventEmitter {
 
   /**
    * Set the external tx signing method.
-   * @param {EcdsaTxSign|null} method
+   *
+   * @param method The external transaction signing method, or null to clear
    */
-  setExternalTxSigningMethod(method: any): any {
+  setExternalTxSigningMethod(method: EcdsaTxSign | null): void {
     this.isSignedExternally = !!method;
     this.storage.setTxSignatureMethod(method);
   }
 
   /**
-   * Set the history sync mode.
-   * @param {HistorySyncMode} mode
+   * Set the shielded crypto provider for confidential transaction support.
+   * Use this for explicit injection (e.g., mobile apps using UniFFI bindings).
+   *
+   * @param provider The shielded crypto provider, or undefined to disable
    */
-  setHistorySyncMode(mode: any): any {
+  setShieldedCryptoProvider(provider?: IShieldedCryptoProvider): void {
+    this.storage.setShieldedCryptoProvider(provider);
+  }
+
+  /**
+   * Set the history sync mode.
+   *
+   * @param mode The history sync mode to use
+   */
+  setHistorySyncMode(mode: HistorySyncMode): void {
     this.historySyncMode = mode;
   }
 
   /**
-   * @param {number} startIndex
-   * @param {number} count
-   * @param {boolean} [shouldProcessHistory=false]
-   * @returns {Promise<void>}
+   * Sync wallet history starting from a specific address index.
+   *
+   * @param startIndex The index of the first address to sync
+   * @param count The number of addresses to sync
+   * @param shouldProcessHistory If we should process the transaction history found
    */
-  async syncHistory(startIndex: any, count: any, shouldProcessHistory: any = false): Promise<any> {
+  async syncHistory(
+    startIndex: number,
+    count: number,
+    shouldProcessHistory?: boolean,
+    pinCode?: string
+  ): Promise<void> {
     if (!(await getSupportedSyncMode(this.storage)).includes(this.historySyncMode)) {
       throw new Error('Trying to use an unsupported sync method for this wallet.');
     }
-    let syncMode: any = this.historySyncMode;
+    let syncMode = this.historySyncMode;
     if (
       [HistorySyncMode.MANUAL_STREAM_WS, HistorySyncMode.XPUB_STREAM_WS].includes(
         this.historySyncMode
@@ -3300,33 +3765,47 @@ class HathorWallet extends EventEmitter {
       this.logger.debug('Falling back to http polling API');
       syncMode = HistorySyncMode.POLLING_HTTP_API;
     }
-    const syncMethod: any = getHistorySyncMethod(syncMode);
+    const syncMethod = getHistorySyncMethod(syncMode);
     // This will add the task to the GLL queue and return a promise that
     // resolves when the task finishes executing
     await GLL.add(async () => {
-      await syncMethod(startIndex, count, this.storage, this.conn, shouldProcessHistory);
+      await syncMethod(startIndex, count, this.storage, this.conn, shouldProcessHistory, pinCode);
     });
   }
 
   /**
-   * Reload all addresses and transactions from the full node
+   * Reload all addresses and transactions from the full node.
    */
-  async reloadStorage(): Promise<any> {
+  async reloadStorage(): Promise<void> {
     await this.conn.onReload();
 
-    // unsub all addresses
+    // unsub all addresses. getAllAddresses() yields the legacy chain; shielded
+    // receives are subscribed by their on-chain spend-derived P2PKH (the 71-byte
+    // shielded address itself is never subscribed — the fullnode indexes by
+    // on-chain script), so also unsubscribe each shielded record's paired spend
+    // P2PKH (ctMappingAddress). Without this, shielded subscriptions leak on reload.
     for await (const address of this.storage.getAllAddresses()) {
       this.conn.unsubscribeAddress(address.base58);
     }
-    const accessData: any = await this.storage.getAccessData();
+    for await (const address of this.storage.getAllAddresses({ legacy: false })) {
+      if (address.ctMappingAddress) {
+        this.conn.unsubscribeAddress(address.ctMappingAddress);
+      }
+    }
+    const accessData = await this.storage.getAccessData();
     if (accessData != null) {
       // Clean entire storage
       await this.storage.cleanStorage(true, true);
       // Reset access data
       await this.storage.saveAccessData(accessData);
     }
-    const addressesToLoad: any = await scanPolicyStartAddresses(this.storage);
-    await this.syncHistory(addressesToLoad.nextIndex, addressesToLoad.count);
+    const addressesToLoad = await scanPolicyStartAddresses(this.storage);
+    await this.syncHistory(
+      addressesToLoad.nextIndex,
+      addressesToLoad.count,
+      false,
+      this.pinCode ?? undefined
+    );
   }
 
   /**
@@ -3352,7 +3831,7 @@ class HathorWallet extends EventEmitter {
         throw new Error(ERROR_MESSAGE_PIN_REQUIRED);
       }
       await transactionUtils.signTransaction(tx, this.storage, pin);
-      tx.prepareToSend();
+      tx.prepareToSend(transactionUtils.getWeightConstantsFromStorage(this.storage));
     }
     return tx;
   }
@@ -3375,66 +3854,57 @@ class HathorWallet extends EventEmitter {
   }
 
   /**
-   * @typedef {Object} CreateOnChainBlueprintTxOptions
-   * @property {string?} [pinCode] PIN to decrypt the private key.
-   */
-
-  /**
    * Create and send an on chain blueprint transaction
    *
-   * @param {string} code Blueprint code in utf-8
-   * @param {string} address Address that will be used to sign the on chain blueprint transaction
-   * @param {CreateOnChainBlueprintTxOptions} [options]
-   *
-   * @returns {Promise<OnChainBlueprint>}
+   * @param code Blueprint code in utf-8
+   * @param address Address that will be used to sign the on chain blueprint transaction
+   * @param options Options for the on chain blueprint transaction
    */
   async createAndSendOnChainBlueprintTransaction(
-    code: any,
-    address: any,
-    options: any = {}
-  ): Promise<any> {
-    const sendTransaction: any = await this.createOnChainBlueprintTransaction(
-      code,
-      address,
-      options
-    );
+    code: string,
+    address: string,
+    options: CreateOnChainBlueprintTxOptions = {}
+  ): Promise<Transaction | null> {
+    const sendTransaction = await this.createOnChainBlueprintTransaction(code, address, options);
     return sendTransaction.runFromMining();
   }
 
   /**
    * Create an on chain blueprint transaction and return the SendTransaction object
    *
-   * @param {string} code Blueprint code in utf-8
-   * @param {string} address Address that will be used to sign the on chain blueprint transaction
-   * @param {CreateOnChainBlueprintTxOptions} [options]
-   *
-   * @returns {Promise<SendTransaction>}
+   * @param code Blueprint code in utf-8
+   * @param address Address that will be used to sign the on chain blueprint transaction
+   * @param options Options for the on chain blueprint transaction
    */
-  async createOnChainBlueprintTransaction(code: any, address: any, options: any): Promise<any> {
+  async createOnChainBlueprintTransaction(
+    code: string,
+    address: string,
+    options: CreateOnChainBlueprintTxOptions = {}
+  ): Promise<SendTransaction> {
     if (await this.storage.isReadonly()) {
       throw new WalletFromXPubGuard('createOnChainBlueprintTransaction');
     }
-    const newOptions: any = { pinCode: null, ...options };
-    const pin: any = newOptions.pinCode || this.pinCode;
+    const newOptions = { pinCode: null, ...options };
+    const pin = newOptions.pinCode || this.pinCode;
     if (!pin) {
       throw new PinRequiredError(ERROR_MESSAGE_PIN_REQUIRED);
     }
 
     // Get caller pubkey
-    const addressInfo: any = await this.storage.getAddressInfo(address);
+    const addressInfo = await this.storage.getAddressInfo(address);
     if (!addressInfo) {
       throw new NanoContractTransactionError(
         `Address used to sign the transaction (${address}) does not belong to the wallet.`
       );
     }
-    const pubkeyStr: any = await this.storage.getAddressPubkey(addressInfo.bip32AddressIndex);
-    const pubkey: any = Buffer.from(pubkeyStr, 'hex');
+    const pubkeyStr = await this.storage.getAddressPubkey(addressInfo.bip32AddressIndex);
+    const pubkey = Buffer.from(pubkeyStr, 'hex');
 
     // Create code object from code data
-    const codeContent: any = Buffer.from(code, 'utf8');
-    const codeObj: any = new Code(CodeKind.PYTHON_ZLIB, codeContent);
+    const codeContent = Buffer.from(code, 'utf8');
+    const codeObj = new Code(CodeKind.PYTHON_ZLIB, codeContent);
 
-    const tx: any = new OnChainBlueprint(codeObj, pubkey);
+    const tx = new OnChainBlueprint(codeObj, pubkey);
 
     return prepareNanoSendTransaction(tx, pin, this.storage);
   }
@@ -3442,25 +3912,124 @@ class HathorWallet extends EventEmitter {
   /**
    * Get the seqnum to be used in a nano header for the address
    *
-   * @param {string} address Address string that will be the nano header caller
-   *
-   * @returns {Promise<number>}
+   * @param address Address string that will be the nano header caller
    */
-  async getNanoHeaderSeqnum(address: any): Promise<any> {
-    const addressInfo: any = await this.storage.getAddressInfo(address);
-    return addressInfo.seqnum + 1;
+  async getNanoHeaderSeqnum(address: string): Promise<number> {
+    const addressInfo = await this.storage.getAddressInfo(address);
+    return addressInfo!.seqnum! + 1;
   }
 
+  /**
+   * Set the caller address and seqnum on a nano contract header
+   *
+   * @param nanoHeader The nano contract header to modify
+   * @param address The new caller address
+   */
+  async setNanoHeaderCaller(nanoHeader: NanoContractHeader, address: string): Promise<void> {
+    const addressInfo = await this.storage.getAddressInfo(address);
+    if (!addressInfo) {
+      throw new NanoContractTransactionError(
+        `Address used to sign the transaction (${address}) does not belong to the wallet.`
+      );
+    }
+
+    await setNanoHeaderCallerFromWallet(nanoHeader, address, this as unknown as IHathorWallet);
+  }
+
+  /**
+   * Start wallet in read-only mode
+   *
+   * @param options Options for starting in read-only mode
+   * @throws Error - This method is not implemented
+   */
   // eslint-disable-next-line class-methods-use-this
-  async startReadOnly(
-    options?: { skipAddressFetch?: boolean | undefined } | undefined
-  ): Promise<void> {
+  async startReadOnly(options?: StartReadOnlyOptions): Promise<void> {
     throw new Error('Not Implemented');
   }
 
+  /**
+   * Get authentication token for read-only mode
+   *
+   * @throws Error - This method is not implemented
+   */
   // eslint-disable-next-line class-methods-use-this
   async getReadOnlyAuthToken(): Promise<string> {
     throw new Error('Not implemented.');
+  }
+
+  /**
+   * Get which address mode is currently enabled.
+   *
+   * @memberof HathorWallet
+   * @inner
+   */
+  async getAddressMode(): Promise<WalletAddressMode> {
+    if (!this.isReady()) {
+      throw new WalletError('Wallet not ready');
+    }
+
+    const scanPolicy = await this.storage.getScanningPolicy();
+    if (scanPolicy === SCANNING_POLICY.SINGLE_ADDRESS) {
+      return WalletAddressMode.SINGLE;
+    }
+    return WalletAddressMode.MULTI;
+  }
+
+  /**
+   * Enable multi address mode for this wallet.
+   * Converts to a gap-limit wallet.
+   *
+   * @memberof HathorWallet
+   * @inner
+   */
+  async enableMultiAddressMode(gapLimit: number = GAP_LIMIT): Promise<void> {
+    if (!this.isReady()) {
+      throw new WalletError('Wallet not ready');
+    }
+
+    const currScanPolicy = await this.storage.getScanningPolicy();
+    if (currScanPolicy !== SCANNING_POLICY.SINGLE_ADDRESS) {
+      // multi address mode is already enabled.
+      return;
+    }
+
+    // Switch policy in storage
+    await this.storage.setScanningPolicyData({
+      policy: SCANNING_POLICY.GAP_LIMIT,
+      gapLimit,
+    });
+
+    // Load new addresses
+    await this.reloadStorage();
+  }
+
+  /**
+   * Enable single-address scanning policy for this wallet.
+   * Converts a gap-limit wallet to use only the first address (index 0).
+   *
+   * @memberof HathorWallet
+   * @inner
+   */
+  async enableSingleAddressMode(): Promise<void> {
+    if (await this.hasTxOutsideFirstAddress()) {
+      throw new HasTxOutsideFirstAddressError(
+        'Cannot enable single-address policy: wallet has transactions on addresses other than the first'
+      );
+    }
+
+    const currScanPolicy = await this.storage.getScanningPolicy();
+    if (currScanPolicy === SCANNING_POLICY.SINGLE_ADDRESS) {
+      // single address mode is already enabled.
+      return;
+    }
+
+    // Switch policy in storage
+    await this.storage.setScanningPolicyData({
+      policy: SCANNING_POLICY.SINGLE_ADDRESS,
+    });
+
+    // Load new addresses
+    await this.reloadStorage();
   }
 }
 

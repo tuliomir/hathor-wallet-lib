@@ -11,7 +11,7 @@ import txApi from '../api/txApi';
 import { NATIVE_TOKEN_UID, SELECT_OUTPUTS_TIMEOUT } from '../constants';
 import { ErrorMessages } from '../errorMessages';
 import { SendTxError, WalletError } from '../errors';
-import Address from '../models/address';
+import { getAddressType } from '../utils/address';
 import CreateTokenTransaction from '../models/create_token_transaction';
 import { Fee } from '../utils/fee';
 import Transaction from '../models/transaction';
@@ -32,7 +32,7 @@ import tokens from '../utils/tokens';
 import transactionUtils from '../utils/transaction';
 import { bestUtxoSelection } from '../utils/utxo';
 import MineTransaction from '../wallet/mineTransaction';
-import { OutputType } from '../wallet/types';
+import { ISendTransaction as ISendTransactionInterface, OutputType } from '../wallet/types';
 import HathorWallet from './wallet';
 import Header from '../headers/base';
 import FeeHeader from '../headers/fee';
@@ -54,7 +54,11 @@ export function isDataOutput(output: ISendOutput): output is ISendDataOutput {
 }
 
 export interface ISendTokenOutput {
-  type: OutputType.P2PKH | OutputType.P2SH;
+  // XXX: This type is ignored in the only place it is used
+  // It was made optional because the ultimately the type is derived from the address at runtime,
+  // see prepareTxData().
+  // Making it optional allows ProposedOutput to be passed directly as ISendOutput.
+  type?: OutputType.P2PKH | OutputType.P2SH;
   address: string;
   value: OutputValueType;
   token: string;
@@ -79,7 +83,7 @@ export type ISendOutput = ISendDataOutput | ISendTokenOutput;
  * 'send-error': if an error happens;
  * 'unexpected-error': if an unexpected error happens;
  * */
-export default class SendTransaction extends EventEmitter {
+export default class SendTransaction extends EventEmitter implements ISendTransactionInterface {
   wallet: HathorWallet | null;
 
   storage: IStorage | null;
@@ -97,6 +101,8 @@ export default class SendTransaction extends EventEmitter {
   fullTxData: IDataTx | null;
 
   mineTransaction: MineTransaction | null = null;
+
+  private _currentStep: 'idle' | 'prepared' | 'signed' = 'idle';
 
   /**
    *
@@ -182,7 +188,6 @@ export default class SendTransaction extends EventEmitter {
           token: output.token,
         });
       } else {
-        const addressObj = new Address(output.address, { network });
         // We set chooseInputs true as default and may be overwritten by the inputs.
         // chooseInputs should be true if no inputs are given
         tokenMap.set(output.token, true);
@@ -193,7 +198,7 @@ export default class SendTransaction extends EventEmitter {
           timelock: output.timelock ? output.timelock : null,
           authorities: 0n,
           token: output.token,
-          type: addressObj.getType(),
+          type: getAddressType(output.address, network),
         });
       }
     }
@@ -314,8 +319,38 @@ export default class SendTransaction extends EventEmitter {
   }
 
   /**
-   * Prepare transaction data from inputs and outputs
-   * Fill the inputs if needed, create output change if needed and sign inputs
+   * Prepare transaction without signing it.
+   * Fill the inputs if needed, create output change if needed.
+   *
+   * @throws SendTxError
+   *
+   * @return {Transaction} Transaction object prepared to be signed
+   *
+   * @memberof SendTransaction
+   * @inner
+   */
+  async prepareTx(): Promise<Transaction> {
+    if (!this.storage) {
+      throw new SendTxError('Storage is not set.');
+    }
+
+    const txData = this.fullTxData || (await this.prepareTxData());
+    try {
+      this.transaction = await transactionUtils.prepareTransaction(txData, '', this.storage, {
+        signTx: false,
+      });
+      // This will validate if the transaction has more than the max number of inputs and outputs.
+      this.transaction.validate();
+      this._currentStep = 'prepared';
+      return this.transaction;
+    } catch (e) {
+      const message = helpers.handlePrepareDataError(e);
+      throw new SendTxError(message);
+    }
+  }
+
+  /**
+   * Sign the transaction and prepare the tx to be mined
    *
    * @param {string | null} pin Pin to use in this method (overwrites this.pin)
    *
@@ -326,20 +361,26 @@ export default class SendTransaction extends EventEmitter {
    * @memberof SendTransaction
    * @inner
    */
-  async prepareTx(pin = null): Promise<Transaction> {
+  async signTx(pin: string | null = null): Promise<Transaction> {
     if (!this.storage) {
       throw new SendTxError('Storage is not set.');
     }
 
+    if (!this.transaction) {
+      throw new SendTxError('Transaction is not set.');
+    }
+
     const pinToUse = pin ?? this.pin ?? '';
-    const txData = this.fullTxData || (await this.prepareTxData());
     try {
-      if (!pinToUse) {
-        throw new Error('Pin is not set.');
+      // The pin is only needed to decrypt the local private key; an external tx-signing
+      // method (e.g. a hardware or passkey signer) signs without it, so it is optional then.
+      if (!pinToUse && !this.storage.hasTxSignatureMethod()) {
+        throw new SendTxError('Pin is not set.');
       }
-      this.transaction = await transactionUtils.prepareTransaction(txData, pinToUse, this.storage);
-      // This will validate if the transaction has more than the max number of inputs and outputs.
-      this.transaction.validate();
+
+      await transactionUtils.signTransaction(this.transaction, this.storage, pinToUse);
+      this.transaction.prepareToSend(transactionUtils.getWeightConstantsFromStorage(this.storage));
+      this._currentStep = 'signed';
       return this.transaction;
     } catch (e) {
       const message = helpers.handlePrepareDataError(e);
@@ -395,7 +436,7 @@ export default class SendTransaction extends EventEmitter {
         this.fullTxData,
         this.storage.config.getNetwork()
       );
-      this.transaction.prepareToSend();
+      this.transaction.prepareToSend(transactionUtils.getWeightConstantsFromStorage(this.storage));
       return this.transaction;
     } catch (e) {
       const message = helpers.handlePrepareDataError(e);
@@ -506,7 +547,17 @@ export default class SendTransaction extends EventEmitter {
                 // This just returns if the transaction is not a CREATE_TOKEN_TX
                 await addCreatedTokenFromTx(transaction as CreateTokenTransaction, storage);
                 // Add new transaction to the wallet's storage.
-                wallet.enqueueOnNewTx({ history: historyTx });
+                // Pass the pin used for this send so the wallet can decrypt and
+                // credit its own shielded change even when it holds no stored
+                // pinCode (per-call-pin flow).
+                // The type labels the WS event this sender-local insert emulates
+                // (the fullnode will deliver the real one for this tx shortly);
+                // only the handleWebsocketMsg router inspects it, and this path
+                // bypasses the router.
+                wallet.enqueueOnNewTx(
+                  { type: 'wallet:address_history', history: historyTx },
+                  this.pin ?? undefined
+                );
               })(this.wallet, this.storage, this.transaction);
             }
             this.emit('send-tx-success', this.transaction);
@@ -536,7 +587,7 @@ export default class SendTransaction extends EventEmitter {
    * @memberof SendTransaction
    * @inner
    */
-  async runFromMining(until = null): Promise<Transaction> {
+  async runFromMining(until: 'mine-tx' | null = null): Promise<Transaction> {
     try {
       if (this.transaction === null) {
         throw new WalletError(ErrorMessages.TRANSACTION_IS_NULL);
@@ -581,16 +632,33 @@ export default class SendTransaction extends EventEmitter {
    * Run sendTransaction from preparing, i.e. prepare, sign, mine and push the tx
    *
    * 'until' parameter can be 'prepare-tx' (it will stop before signing the tx),
+   * 'sign-tx' (it will stop before mining the tx),
    * or 'mine-tx' (it will stop before send tx proposal, i.e. propagating the tx)
+   *
+   * Can be called incrementally: run('prepare-tx') then run(null) to continue.
    *
    * @memberof SendTransaction
    * @inner
    */
-  async run(until = null, pin = null) {
+  async run(
+    until: 'prepare-tx' | 'sign-tx' | 'mine-tx' | null = null,
+    pin: string | null = null
+  ): Promise<Transaction> {
     try {
-      await this.prepareTx(pin);
+      if (this._currentStep === 'idle') {
+        await this.prepareTx();
+      }
+
       if (until === 'prepare-tx') {
-        return this.transaction;
+        return this.transaction!;
+      }
+
+      if (this._currentStep === 'prepared') {
+        await this.signTx(pin);
+      }
+
+      if (until === 'sign-tx') {
+        return this.transaction!;
       }
 
       const tx = await this.runFromMining(until);
@@ -628,6 +696,29 @@ export default class SendTransaction extends EventEmitter {
         selected,
         SELECT_OUTPUTS_TIMEOUT
       );
+    }
+  }
+
+  /**
+   * Release all UTXOs that were marked as selected for this transaction.
+   * Call this when the transaction is rejected or abandoned to free the locked UTXOs.
+   */
+  async releaseUtxos(): Promise<void> {
+    if (this.transaction === null) {
+      return;
+    }
+
+    if (!this.storage) {
+      return;
+    }
+
+    for (const input of this.transaction.inputs) {
+      try {
+        await this.storage.utxoSelectAsInput({ txId: input.hash, index: input.index }, false);
+      } catch (err) {
+        // Best-effort: continue releasing remaining UTXOs
+        this.storage.logger.debug(`Failed to release UTXO ${input.hash}:${input.index}: ${err}`);
+      }
     }
   }
 }

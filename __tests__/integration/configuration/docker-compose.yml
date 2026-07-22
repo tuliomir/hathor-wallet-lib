@@ -4,16 +4,18 @@ services:
   # All the following services are related to the core of the Private Network
   # For more information on these configs, refer to:
   # https://github.com/HathorNetwork/rfcs/blob/master/text/0033-private-network-guide.md
-  # Fullnode on 8080 , tx mining service on 8035, cpuminer stratum on 8034
+  # Fullnode on 8080, tx-mining-service API on 8035, tx-mining-service DevMiner on 8034
+
 
   fullnode:
     image:
-      ${HATHOR_LIB_INTEGRATION_TESTS_FULLNODE_IMAGE:-hathornetwork/hathor-core:experimental-push_fee_header}
+      ${HATHOR_LIB_INTEGRATION_TESTS_FULLNODE_IMAGE:-hathornetwork/hathor-core:sha-dc521be2}
     command: [
       "run_node",
       "--listen", "tcp:40404",
       "--status", "8080",
       "--test-mode-tx-weight",
+      "--test-mode-block-weight",
       "--wallet-index",
       "--allow-mining-without-peers",
       "--unsafe-mode", "nano-testnet-bravo",
@@ -52,21 +54,11 @@ services:
     command: [
       "http://fullnode:8080",
       "--stratum-port=8034",
-      "--api-port=8035"
-    ]
-    networks:
-      - hathor-privnet
-
-  cpuminer:
-    image: hathornetwork/cpuminer
-    depends_on:
-      - tx-mining-service
-    command: [
-      "-a", "sha256d",
-      "--coinbase-addr", "WTjhJXzQJETVx7BVXdyZmvk396DRRsubdw", # Refer to test-utils-integration.js, WALLET_CONSTANTS
-      "-o", "stratum+tcp://tx-mining-service:8034",
-      "--retry-pause", "5", # 5 seconds between retries
-      "-t", "1" # Number of threads used to mine
+      "--block-interval=1000",
+      "--api-port=8035",
+      "--dev-miner",
+      "--testnet",
+      "--address", "WTjhJXzQJETVx7BVXdyZmvk396DRRsubdw", # Miner rewards address (WALLET_CONSTANTS.miner in test-constants.ts)
     ]
     networks:
       - hathor-privnet
@@ -240,6 +232,20 @@ services:
       - "3001:3001"
     networks:
       - hathor-privnet
+
+  # Wallet Provider section
+  # Serves precalculated wallets on demand (GET /simpleWallet), replacing the
+  # former static precalculated-wallets.json. ADDRESS_COUNT defaults to 22 in
+  # the image, matching the old static set.
+  # https://github.com/HathorNetwork/hathor-integration-test-helper
+  wallet-provider:
+    image:
+      ${HATHOR_LIB_INTEGRATION_TESTS_WALLET_PROVIDER_IMAGE:-hathornetwork/hathor-integration-test-helper:latest}
+    ports:
+      - "3020:3020"
+    networks:
+      - hathor-privnet
+    # TODO: add a healthcheck once the ITH exposes a readiness endpoint.
 
 networks:
   hathor-privnet:

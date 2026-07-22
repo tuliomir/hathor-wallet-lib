@@ -11,6 +11,7 @@ import assert from 'assert';
 import Header from '../headers/base';
 import FeeHeader from '../headers/fee';
 import {
+  DECIMAL_PLACES,
   NATIVE_TOKEN_UID,
   TOKEN_MINT_MASK,
   AUTHORITY_TOKEN_DATA,
@@ -18,9 +19,11 @@ import {
   WALLET_SERVICE_AUTH_DERIVATION_PATH,
   P2SH_ACCT_PATH,
   P2PKH_ACCT_PATH,
+  GAP_LIMIT,
 } from '../constants';
 import { decryptData, signMessage } from '../utils/crypto';
 import walletApi from './api/walletApi';
+import { retryOnTransientWalletError } from './walletServiceRetry';
 import { deriveAddressFromXPubP2PKH } from '../utils/address';
 import walletUtils from '../utils/wallet';
 import helpers from '../utils/helpers';
@@ -43,7 +46,6 @@ import {
   GetBalanceObject,
   GetAddressesObject,
   GetHistoryObject,
-  WalletStatus,
   Utxo,
   OutputType,
   OutputSendTransaction,
@@ -62,13 +64,14 @@ import {
   FullNodeVersionData,
   WalletAddressMap,
   TxByIdTokensResponseData,
-  DelegateAuthorityOptions,
-  DestroyAuthorityOptions,
+  WalletServiceDelegateAuthorityOptions,
+  WalletServiceDestroyAuthorityOptions,
   FullNodeTxResponse,
   FullNodeTxConfirmationDataResponse,
   GetAddressDetailsObject,
   CreateTokenOptionsInput,
 } from './types';
+import type { IShieldedCryptoProvider } from '../shielded/types';
 import {
   SendTxError,
   UtxoError,
@@ -78,17 +81,22 @@ import {
   WalletFromXPubGuard,
   PinRequiredError,
   TokenNotFoundError,
+  HasTxOutsideFirstAddressError,
 } from '../errors';
 import NanoContractTransactionBuilder from '../nano_contracts/builder';
+import NanoContractHeader from '../nano_contracts/header';
 import {
   NanoContractVertexType,
   NanoContractBuilderCreateTokenOptions,
   CreateNanoTxData,
+  CreateNanoTxOptions,
 } from '../nano_contracts/types';
+import { setNanoHeaderCallerFromWallet } from '../nano_contracts/utils';
 import { WalletServiceStorageProxy } from './walletServiceStorageProxy';
 import HathorWallet from '../new/wallet';
 import { ErrorMessages } from '../errorMessages';
 import {
+  ApiVersion,
   IStorage,
   IWalletAccessData,
   OutputValueType,
@@ -97,12 +105,30 @@ import {
   WalletType,
   ITokenData,
   TokenVersion,
+  SCANNING_POLICY,
+  WalletAddressMode,
 } from '../types';
 import { Fee } from '../utils/fee';
 
 // Time in milliseconds berween each polling to check wallet status
 // if it ended loading and became ready
 const WALLET_STATUS_POLLING_INTERVAL = 1000;
+
+// Maximum number of polling attempts before timing out
+const MAX_WALLET_STATUS_POLL_ATTEMPTS = 60;
+
+// Wallet status values returned by the wallet-service API
+const WS_STATUS_READY = 'ready';
+const WS_STATUS_CREATING = 'creating';
+
+// Bounded retry budget for the wallet-service auth-token renewal.
+//
+// Context: right after `createWallet` returns, the `/auth/token` endpoint can
+// briefly respond with a transient error while the wallet-service's internal
+// state settles.
+// That renewal is awaited and errors propagate, we need an explicit bounded retry
+// to keep integration tests (and real clients) tolerant of the same settling race.
+const MAX_AUTH_TOKEN_RENEW_ATTEMPTS = 3;
 
 enum walletState {
   NOT_STARTED = 'Not started',
@@ -138,12 +164,6 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
   // State of the wallet. One of the walletState enum options
   private state: string;
 
-  // Variable to prevent start sending more than one tx concurrently
-  private isSendingTx: boolean;
-
-  // ID of tx proposal
-  private txProposalId: string | null;
-
   // Auth token to be used in the wallet API requests to wallet service
   private authToken: string | null;
 
@@ -163,6 +183,12 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
   // Flag to indicate if the websocket connection is enabled
   private readonly _isWsEnabled: boolean;
 
+  // Flag to indicate if the wallet is in single-address mode
+  private singleAddress: boolean;
+
+  // Address at index 0
+  private firstAddress: string | null;
+
   public storage: IStorage;
 
   constructor({
@@ -175,6 +201,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     passphrase = '',
     enableWs = true,
     storage = null,
+    singleAddressMode = false,
   }: {
     requestPassword: () => Promise<string>;
     seed?: string | null;
@@ -185,6 +212,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     passphrase?: string;
     enableWs?: boolean;
     storage?: IStorage | null;
+    singleAddressMode?: boolean;
   }) {
     super();
 
@@ -235,8 +263,6 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
 
     // ID of wallet after created on wallet service
     this.walletId = null;
-    this.isSendingTx = false;
-    this.txProposalId = null;
 
     this.network = network;
     networkInstance.setNetwork(this.network.name);
@@ -246,6 +272,9 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
 
     this.newAddresses = [];
     this.indexToUse = -1;
+    this.singleAddress = singleAddressMode;
+    this.firstAddress = null;
+
     // TODO should we have a debug mode?
   }
 
@@ -432,21 +461,6 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       await this.storage.saveAccessData(accessData);
     }
 
-    let renewPromise: Promise<void> | null = null;
-    let renewPromiseError = null;
-    if (accessData.acctPathKey) {
-      // We can preemtively request/renew the auth token so the wallet can wait for this process
-      // to finish while we derive and request the wallet creation.
-      // This call will fail is the wallet is being created for the first time.
-      const acctKey = decryptData(accessData.acctPathKey, pinCode);
-      const privKeyAccountPath = bitcore.HDPrivateKey(acctKey);
-      const walletId = HathorWalletServiceWallet.getWalletIdFromXPub(privKeyAccountPath.xpubkey);
-      this.walletId = walletId;
-      renewPromise = this.validateAndRenewAuthToken(pinCode).catch(err => {
-        renewPromiseError = err;
-      });
-    }
-
     const {
       xpub,
       authXpub,
@@ -456,49 +470,10 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       firstAddress,
       authDerivedPrivKey,
     } = await this.generateCreateWalletAuthData(accessData, pinCode);
-
-    if (!renewPromise) {
-      // we need to start the process to renew the auth token If for any reason we had to
-      // derive the account path xpubkey on the method above.
-      const walletId = HathorWalletServiceWallet.getWalletIdFromXPub(xpub);
-      this.walletId = walletId;
-      renewPromise = this.validateAndRenewAuthToken(pinCode).catch(err => {
-        renewPromiseError = err;
-      });
-    }
+    this.firstAddress = firstAddress;
 
     this.xpub = xpub;
     this.authPrivKey = authDerivedPrivKey;
-
-    let renewPromise2Error = null;
-    const handleCreate = async (data: WalletStatus, tokenRenewPromise: Promise<void> | null) => {
-      this.walletId = data.walletId;
-
-      if (data.status === 'creating') {
-        // If the wallet status is creating, we should wait until it is ready
-        // before continuing
-        await this.pollForWalletStatus();
-      } else if (data.status !== 'ready') {
-        // At this stage, if the wallet is not `ready` or `creating` we should
-        // throw an error as there are only three states: `ready`, `creating` or `error`
-        throw new WalletRequestError(ErrorMessages.WALLET_STATUS_ERROR, { cause: data.status });
-      }
-
-      if (tokenRenewPromise !== null) {
-        try {
-          if (renewPromise2Error) {
-            // If an error happened async before this await, we must
-            // throw it, for it to be captured by the following catch
-            throw renewPromise2Error;
-          }
-          await tokenRenewPromise;
-        } catch (err) {
-          this.authToken = null;
-        }
-      }
-
-      await this.onWalletReady();
-    };
 
     const data = await walletApi.createWallet(
       this,
@@ -510,8 +485,20 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       firstAddress
     );
 
-    // Set walletId immediately after wallet creation
     this.walletId = data.status.walletId;
+
+    // Populate `storage.version` with the fullnode network constants.
+    // Without this, `prepareToSend` would always fall back to the hardcoded
+    // mainnet TX_WEIGHT_CONSTANTS, ignoring the connected network's reported
+    // `min_tx_weight*` values — see HathorWallet.start in src/new/wallet.ts
+    // where the equivalent setApiVersion call lives.
+    //
+    // Run this BEFORE the `waitReady === false` early return so both
+    // public startup paths (waitReady=true and waitReady=false) populate
+    // the field. Otherwise non-blocking-startup callers would silently
+    // fall back to TX_WEIGHT_CONSTANTS forever, defeating the purpose of
+    // this feature.
+    await this.populateStorageVersion();
 
     // If waitReady is false, return immediately after wallet creation
     if (!waitReady) {
@@ -519,30 +506,72 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       return;
     }
 
-    // If auth token api fails we can still retry during wallet creation status polling.
-    let renewPromise2: Promise<void> | null = null;
-    try {
-      if (renewPromiseError) {
-        // If an error happened async before this await, we must
-        // throw it, for it to be captured by the following catch
-        throw renewPromiseError;
-      }
-      // Here we await the first auth token api call before continuing the startup process.
-      await renewPromise;
-    } catch (err) {
-      // If the wallet was being created the api would fail, but we will try to request a new token
-      // now that the wallet was created and before it is ready.
-      this.authToken = null;
-      const walletId = HathorWalletServiceWallet.getWalletIdFromXPub(xpub);
-      this.walletId = walletId;
-      renewPromise2 = this.validateAndRenewAuthToken(pinCode).catch(renew2Err => {
-        renewPromise2Error = renew2Err;
+    if (data.status.status === WS_STATUS_CREATING) {
+      // If the wallet status is creating, we should wait until it is ready
+      // before continuing
+      await this.pollForWalletStatus();
+    } else if (data.status.status !== WS_STATUS_READY) {
+      // At this stage, if the wallet is not 'ready' or 'creating' we should
+      // throw an error as there are only three states: 'ready', 'creating' or 'error'
+      throw new WalletRequestError(ErrorMessages.WALLET_STATUS_ERROR, {
+        cause: { state: data.status },
       });
     }
 
-    await handleCreate(data.status, renewPromise2);
-
+    // Auth token renewal is NOT called explicitly here. The axios interceptor
+    // in walletServiceAxios.ts handles it on-demand: any authenticated API
+    // call (including getWalletStatus during polling) triggers
+    // validateAndRenewAuthToken() automatically when the token is missing or
+    // expired. By this point, authPrivKey and walletId are both set, so the
+    // interceptor can obtain a token without needing the PIN.
+    await this.onWalletReady();
     this.clearSensitiveData();
+  }
+
+  /**
+   * Fetch the connected wallet-service's /version response and write it to
+   * `storage.version` so internal callers (notably `prepareToSend` via
+   * `transactionUtils.getWeightConstantsFromStorage`) consume the network's
+   * actual weight constants instead of the hardcoded mainnet defaults.
+   *
+   * `walletApi.getVersionData` returns `FullNodeVersionData` (camelCase, and
+   * without `decimal_places` / `native_token`). We map to the snake_case
+   * `ApiVersion` shape that storage expects, defaulting the missing fields:
+   * `decimal_places` to the constant default and `native_token` to null
+   * (storage.getDecimalPlaces / getNativeTokenData already fall back to
+   * constants when those fields are missing).
+   *
+   * Non-fatal: any failure is logged via the storage logger and swallowed.
+   * The wallet still works — `prepareToSend` simply falls back to
+   * `TX_WEIGHT_CONSTANTS` as it did before this method existed. We emit a
+   * warning rather than silently dropping the error so a regression here is
+   * visible in logs instead of producing surprisingly-mined transactions.
+   */
+  private async populateStorageVersion(): Promise<void> {
+    try {
+      const v = await this.getVersionData();
+      const apiVersion: ApiVersion = {
+        version: v.version,
+        network: v.network,
+        min_weight: v.minWeight,
+        min_tx_weight: v.minTxWeight,
+        min_tx_weight_coefficient: v.minTxWeightCoefficient,
+        min_tx_weight_k: v.minTxWeightK,
+        token_deposit_percentage: v.tokenDepositPercentage,
+        token_deposit_percentage_numerator: v.tokenDepositPercentageNumerator,
+        token_deposit_percentage_denominator: v.tokenDepositPercentageDenominator,
+        reward_spend_min_blocks: v.rewardSpendMinBlocks,
+        max_number_inputs: v.maxNumberInputs,
+        max_number_outputs: v.maxNumberOutputs,
+        decimal_places: DECIMAL_PLACES,
+        native_token: null,
+      };
+      this.storage.setApiVersion(apiVersion);
+    } catch (e) {
+      this.storage.logger.warn(
+        `wallet-service /version fetch failed during start(): ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
   }
 
   /**
@@ -737,7 +766,9 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     }
 
     for (const txin of tx.inputs) {
-      if (transaction.isAuthorityOutput(txin)) {
+      // Shielded inputs don't have value/token/token_data fields
+      if (txin.token === undefined) continue;
+      if (transaction.isAuthorityOutput({ token_data: txin.token_data! })) {
         if (options.includeAuthorities) {
           if (!balance[txin.token]) {
             balance[txin.token] = 0n;
@@ -749,7 +780,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
         if (!balance[txin.token]) {
           balance[txin.token] = 0n;
         }
-        balance[txin.token] -= txin.value;
+        balance[txin.token] -= txin.value!;
       }
     }
 
@@ -764,20 +795,41 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
    * @inner
    */
   async pollForWalletStatus(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const pollIntervalTimer = setInterval(async () => {
-        const data = await walletApi.getWalletStatus(this);
-
-        if (data.status.status === 'ready') {
-          clearInterval(pollIntervalTimer);
-          resolve();
-        } else if (data.status.status !== 'creating') {
-          // Only possible states are 'ready', 'creating' and 'error', if status
-          // is not ready or creating, we should reject the promise
-          clearInterval(pollIntervalTimer);
-          reject(new WalletRequestError('Error getting wallet status.', { cause: data.status }));
+    let lastError: WalletRequestError | undefined;
+    let lastState: unknown;
+    for (let attempt = 0; attempt < MAX_WALLET_STATUS_POLL_ATTEMPTS; attempt++) {
+      let data;
+      try {
+        data = await walletApi.getWalletStatus(this);
+      } catch (err) {
+        if (!(err instanceof WalletRequestError)) {
+          throw err;
         }
-      }, WALLET_STATUS_POLLING_INTERVAL);
+        // WalletRequestError means the server (or the auth interceptor)
+        // responded but said no — could be a transient 502/503 or a
+        // momentary auth endpoint hiccup. Retry until we exhaust attempts.
+        lastError = err;
+        await helpers.sleep(WALLET_STATUS_POLLING_INTERVAL);
+        continue;
+      }
+
+      lastError = undefined;
+      lastState = data.status;
+      if (data.status.status === WS_STATUS_READY) {
+        return;
+      }
+      // Only possible states are 'ready', 'creating' and 'error'. If status
+      // is not ready or creating, we should throw an error.
+      if (data.status.status !== WS_STATUS_CREATING) {
+        throw new WalletRequestError('Error getting wallet status.', {
+          cause: { state: data.status },
+        });
+      }
+
+      await helpers.sleep(WALLET_STATUS_POLLING_INTERVAL);
+    }
+    throw new WalletRequestError('Wallet status polling timed out.', {
+      cause: lastError ? { source: lastError } : { state: lastState },
     });
   }
 
@@ -800,6 +852,21 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
    * @inner
    */
   private async onWalletReady(skipAddressFetch: boolean = false) {
+    if (this.singleAddress) {
+      try {
+        await this.enableSingleAddressMode(true);
+      } catch (error) {
+        if (error instanceof HasTxOutsideFirstAddressError) {
+          await this.storage.setScanningPolicyData({
+            policy: SCANNING_POLICY.GAP_LIMIT,
+            gapLimit: GAP_LIMIT,
+          });
+          this.singleAddress = false;
+        } else {
+          throw error;
+        }
+      }
+    }
     // We should wait for new addresses before setting wallet to ready
     // Skip address fetching if requested (useful for read-only wallets that don't need gap addresses)
     if (!skipAddressFetch) {
@@ -877,6 +944,10 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       // We should fail if the wallet is not ready because the wallet service address load mechanism is
       // asynchronous, so we will get an empty or partial array of addresses if they are not all loaded.
       this.failIfWalletNotReady();
+    }
+    if (this.singleAddress) {
+      await this.prepareSingleAddressMode();
+      return;
     }
     const data = await walletApi.getNewAddresses(this);
     this.newAddresses = data.addresses;
@@ -1148,23 +1219,26 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
         privKey = bitcore.HDPrivateKey.fromString(await this.storage.getAuthPrivKey(password));
       }
 
-      await this.renewAuthToken(privKey, timestampNow);
+      await retryOnTransientWalletError(() => this.renewAuthToken(privKey, timestampNow), {
+        maxAttempts: MAX_AUTH_TOKEN_RENEW_ATTEMPTS,
+        intervalMs: WALLET_STATUS_POLLING_INTERVAL,
+      });
     } else if (usePassword) {
-      // If we have received the user PIN, we should renew the token anyway
-      // without blocking this method's promise
-
+      // Token is valid but the user provided a PIN — renew proactively.
       const privKey = bitcore.HDPrivateKey.fromString(
         await this.storage.getAuthPrivKey(usePassword)
       );
 
-      this.renewAuthToken(privKey, timestampNow);
+      await retryOnTransientWalletError(() => this.renewAuthToken(privKey, timestampNow), {
+        maxAttempts: MAX_AUTH_TOKEN_RENEW_ATTEMPTS,
+        intervalMs: WALLET_STATUS_POLLING_INTERVAL,
+      });
     }
   }
 
   /**
-   * Renew the auth token on the wallet service
-   *
-   * Note: This method is called in a fire-and-forget manner, so it should not throw exceptions when failing.
+   * Renew the auth token on the wallet service.
+   * Throws on failure so callers can handle the root cause.
    *
    * @param {HDPrivateKey} privKey - private key to sign the auth message
    * @param {number} timestamp - Current timestamp to assemble the signature
@@ -1177,16 +1251,9 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       throw new Error('Wallet not ready yet.');
     }
 
-    try {
-      const sign = this.signMessage(privKey, timestamp, this.walletId);
-      const data = await walletApi.createAuthToken(this, timestamp, privKey.xpubkey, sign);
-
-      this.authToken = data.token;
-    } catch (err) {
-      // We should not throw here since this method is called in a fire-and-forget manner
-      // TODO: When this wallet has a logger, we should log this error to help with debugging
-      this.authToken = null;
-    }
+    const sign = this.signMessage(privKey, timestamp, this.walletId);
+    const data = await walletApi.createAuthToken(this, timestamp, privKey.xpubkey, sign);
+    this.authToken = data.token;
   }
 
   /**
@@ -1234,36 +1301,46 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     // Derive walletId from xpub
     const walletId = HathorWalletServiceWallet.getWalletIdFromXPub(this.xpub);
     this.walletId = walletId;
+    if (this.singleAddress) {
+      await this.storage.setScanningPolicyData({ policy: SCANNING_POLICY.SINGLE_ADDRESS });
+    }
 
     // Save accessData for read-only wallet
     // This is required for methods like getAddressPathForIndex() that need walletType
     const accessData = walletUtils.generateAccessDataFromXpub(this.xpub);
     await this.storage.saveAccessData(accessData);
 
-    // Try to get read-only auth token
-    // This will succeed only if wallet is in 'ready' state
-    try {
-      await this.getReadOnlyAuthToken();
-      // Token obtained successfully, wallet is ready
-      await this.onWalletReady(skipAddressFetch);
-    } catch (error) {
-      // Token request failed, check wallet status to determine why
-      const walletStatus = await walletApi.getWalletStatus(this);
-
-      if (walletStatus.status.status === 'creating') {
-        // Wallet is still being created, poll until it's ready
-        await this.pollForWalletStatus();
-        // After polling completes, get the token now that wallet is ready
+    // Poll for read-only auth token. The RO token endpoint (no auth required)
+    // returns 400 while the wallet is still 'creating'. We retry WalletRequestError
+    // (server responded but said no) until it succeeds or we time out.
+    // Non-WalletRequestError (network failures, timeouts) propagate immediately.
+    let lastError: WalletRequestError | undefined;
+    for (let attempt = 0; attempt < MAX_WALLET_STATUS_POLL_ATTEMPTS; attempt++) {
+      try {
         await this.getReadOnlyAuthToken();
-        await this.onWalletReady(skipAddressFetch);
-      } else {
-        // Wallet is in error state or other invalid state
-        throw new WalletRequestError(
-          'Wallet must be initialized and ready before starting in read-only mode.',
-          { cause: walletStatus.status }
-        );
+        lastError = undefined;
+        break;
+      } catch (err) {
+        if (!(err instanceof WalletRequestError)) {
+          throw err;
+        }
+        // Only retry on HTTP 400 (wallet may still be creating).
+        // Other status codes (401, 403, 404, etc.) are permanent failures.
+        const { cause } = err;
+        if (cause && 'status' in cause && cause.status !== 400) {
+          throw err;
+        }
+        lastError = err;
+        await helpers.sleep(WALLET_STATUS_POLLING_INTERVAL);
       }
     }
+    if (lastError) {
+      throw new WalletRequestError(
+        'Read-only wallet startup timed out. The wallet may not be initialized or is in an error state.',
+        { cause: { source: lastError } }
+      );
+    }
+    await this.onWalletReady(skipAddressFetch);
   }
 
   /**
@@ -1471,6 +1548,10 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
    * @inner
    */
   getCurrentAddress({ markAsUsed = false } = {}): AddressInfoObject {
+    if (this.singleAddress) {
+      return this.newAddresses[0];
+    }
+
     const newAddressesLen = this.newAddresses.length;
     if (this.indexToUse > newAddressesLen - 1) {
       const addressInfo = this.newAddresses[newAddressesLen - 1];
@@ -1505,9 +1586,95 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
    * @inner
    */
   getNextAddress(): AddressInfoObject {
+    if (this.singleAddress) {
+      return this.newAddresses[0];
+    }
     // First we mark the current address as used, then return the next
     this.getCurrentAddress({ markAsUsed: true });
     return this.getCurrentAddress();
+  }
+
+  /**
+   * Get which address mode is currently enabled.
+   *
+   * @memberof HathorWalletServiceWallet
+   * @inner
+   */
+  async getAddressMode(): Promise<WalletAddressMode> {
+    this.failIfWalletNotReady();
+
+    if (this.singleAddress) {
+      return WalletAddressMode.SINGLE;
+    }
+    return WalletAddressMode.MULTI;
+  }
+
+  /**
+   * Enable multi address mode for this wallet.
+   * Converts to a gap-limit wallet.
+   *
+   * @memberof HathorWalletServiceWallet
+   * @inner
+   */
+  async enableMultiAddressMode(): Promise<void> {
+    this.failIfWalletNotReady();
+
+    // Switch policy in storage
+    await this.storage.setScanningPolicyData({
+      policy: SCANNING_POLICY.GAP_LIMIT,
+      gapLimit: GAP_LIMIT,
+    });
+
+    this.singleAddress = false;
+    await this.getNewAddresses();
+  }
+
+  /**
+   * Enable single-address scanning policy for this wallet.
+   * Converts a gap-limit wallet to use only the first address (index 0).
+   * Will throw if the wallet has transactions on any address other than the first.
+   *
+   * @memberof HathorWalletServiceWallet
+   * @inner
+   */
+  async enableSingleAddressMode(ignoreWalletReady: boolean = false): Promise<void> {
+    if (await this.hasTxOutsideFirstAddress(ignoreWalletReady)) {
+      throw new HasTxOutsideFirstAddressError(
+        'Cannot enable single-address policy: wallet has transactions on addresses other than the first'
+      );
+    }
+
+    // Switch policy in storage
+    await this.storage.setScanningPolicyData({
+      policy: SCANNING_POLICY.SINGLE_ADDRESS,
+    });
+
+    this.singleAddress = true;
+    await this.prepareSingleAddressMode();
+  }
+
+  /**
+   * Prepare the wallet for single address mode.
+   * Loads first address if needed.
+   *
+   * @memberof HathorWalletServiceWallet
+   * @inner
+   */
+  private async prepareSingleAddressMode(): Promise<void> {
+    if (!this.singleAddress) return;
+
+    if (!this.firstAddress) {
+      this.firstAddress = await this.getAddressAtIndex(0);
+    }
+
+    this.newAddresses = [
+      {
+        address: this.firstAddress,
+        index: 0,
+        addressPath: await this.getAddressPathForIndex(0),
+      },
+    ];
+    this.indexToUse = 0;
   }
 
   /**
@@ -1610,6 +1777,16 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
   }
 
   /**
+   * Set the caller address and seqnum on a nano contract header
+   *
+   * @param nanoHeader The nano contract header to modify
+   * @param address The new caller address
+   */
+  async setNanoHeaderCaller(nanoHeader: NanoContractHeader, address: string): Promise<void> {
+    await setNanoHeaderCallerFromWallet(nanoHeader, address, this);
+  }
+
+  /**
    * Get detailed information about a specific address from the wallet service
    *
    * @param address The address to get details for
@@ -1644,6 +1821,12 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
 
   /* eslint-disable class-methods-use-this */
   getFullHistory(): TransactionFullObject[] {
+    throw new WalletError('Not implemented.');
+  }
+
+  /* eslint-disable-next-line class-methods-use-this, @typescript-eslint/no-unused-vars */
+  setShieldedCryptoProvider(provider?: IShieldedCryptoProvider): void {
+    // Shielded outputs are not supported on the wallet-service backend.
     throw new WalletError('Not implemented.');
   }
 
@@ -1740,8 +1923,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     // 1. Calculate HTR deposit needed
     let deposit = 0n;
     if (tokenVersion === TokenVersion.DEPOSIT) {
-      const depositPercent = this.storage.getTokenDepositPercentage();
-      deposit += tokens.getDepositAmount(amount, depositPercent);
+      deposit += this.getDepositAmount(amount);
     }
 
     if (newOptions.data && newOptions.data.length > 0) {
@@ -1854,7 +2036,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       }
     }
 
-    tx.prepareToSend();
+    tx.prepareToSend(transaction.getWeightConstantsFromStorage(this.storage));
     return tx;
   }
 
@@ -2078,8 +2260,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     // 1. Calculate HTR deposit needed
     let deposit = 0n;
     if (tokenInfo?.version === TokenVersion.DEPOSIT) {
-      const depositPercent = this.storage.getTokenDepositPercentage();
-      deposit = tokens.getDepositAmount(amount, depositPercent);
+      deposit = this.getDepositAmount(amount);
     }
 
     // 2. Get mint authority
@@ -2170,7 +2351,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       }
     }
 
-    tx.prepareToSend();
+    tx.prepareToSend(transaction.getWeightConstantsFromStorage(this.storage));
     return tx;
   }
 
@@ -2250,8 +2431,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     // 1. Calculate HTR withdraw
     let withdraw = 0n;
     if (tokenInfo?.version === TokenVersion.DEPOSIT) {
-      const depositPercent = this.storage.getTokenDepositPercentage();
-      withdraw = tokens.getWithdrawAmount(amount, depositPercent);
+      withdraw = this.getWithdrawAmount(amount);
     }
 
     // 2. Get utxos for custom token to melt
@@ -2374,7 +2554,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       }
     }
 
-    tx.prepareToSend();
+    tx.prepareToSend(transaction.getWeightConstantsFromStorage(this.storage));
     return tx;
   }
 
@@ -2447,6 +2627,36 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
   }
 
   /**
+   * HTR deposit required to mint the given amount of a deposit-based token.
+   *
+   * The deposit percentage is read from the connected fullnode's `/version` data,
+   * so callers pass only the amount. Requires the wallet to be READY.
+   *
+   * @memberof HathorWalletServiceWallet
+   * @inner
+   */
+  getDepositAmount(mintAmount: OutputValueType): OutputValueType {
+    this.failIfWalletNotReady();
+    const { numerator, denominator } = this.storage.getTokenDepositPercentageFraction();
+    return tokens.getDepositAmount(mintAmount, numerator, denominator);
+  }
+
+  /**
+   * HTR withdrawal returned when melting the given amount of a deposit-based token.
+   *
+   * The deposit percentage is read from the connected fullnode's `/version` data,
+   * so callers pass only the amount. Requires the wallet to be READY.
+   *
+   * @memberof HathorWalletServiceWallet
+   * @inner
+   */
+  getWithdrawAmount(meltAmount: OutputValueType): OutputValueType {
+    this.failIfWalletNotReady();
+    const { numerator, denominator } = this.storage.getTokenDepositPercentageFraction();
+    return tokens.getWithdrawAmount(meltAmount, numerator, denominator);
+  }
+
+  /**
    * Prepare delegate authority data, sign the inputs and returns an object ready to be mined
    *
    * @memberof HathorWalletServiceWallet
@@ -2460,7 +2670,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       anotherAuthorityAddress = null,
       createAnother = true,
       pinCode = null,
-    }: DelegateAuthorityOptions
+    }: WalletServiceDelegateAuthorityOptions
   ): Promise<Transaction> {
     this.failIfWalletNotReady();
 
@@ -2535,7 +2745,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     const inputData = this.getInputData(xprivkey, dataToSignHash, addressIndex);
     inputsObj[0].setData(inputData);
 
-    tx.prepareToSend();
+    tx.prepareToSend(transaction.getWeightConstantsFromStorage(this.storage));
 
     return tx;
   }
@@ -2550,7 +2760,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     token: string,
     type: string,
     address: string,
-    options: DelegateAuthorityOptions
+    options: WalletServiceDelegateAuthorityOptions
   ): Promise<Transaction> {
     this.failIfWalletNotReady();
     const tx = await this.prepareDelegateAuthorityData(token, type, address, options);
@@ -2567,7 +2777,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     token: string,
     type: string,
     count: number,
-    { pinCode = null }: DestroyAuthorityOptions
+    { pinCode = null }: WalletServiceDestroyAuthorityOptions
   ): Promise<Transaction> {
     this.failIfWalletNotReady();
 
@@ -2616,7 +2826,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       inputObj.setData(inputData);
     }
 
-    tx.prepareToSend();
+    tx.prepareToSend(transaction.getWeightConstantsFromStorage(this.storage));
     return tx;
   }
 
@@ -2630,7 +2840,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     token: string,
     type: string,
     count: number,
-    options: DestroyAuthorityOptions
+    options: WalletServiceDestroyAuthorityOptions
   ): Promise<Transaction> {
     this.failIfWalletNotReady();
     const tx = await this.prepareDestroyAuthorityData(token, type, count, options);
@@ -2792,7 +3002,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     method: string,
     address: string,
     data: CreateNanoTxData,
-    options: { pinCode?: string } = {}
+    options: CreateNanoTxOptions = {}
   ): Promise<SendTransactionWalletService> {
     this.failIfWalletNotReady();
 
@@ -2800,17 +3010,19 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       throw new WalletFromXPubGuard('createNanoContractTransaction');
     }
 
-    const newOptions = { pinCode: null, ...options };
+    const newOptions = { pinCode: null, signTx: true, ...options };
     const pin = newOptions.pinCode;
-    if (!pin) {
+
+    // Only require PIN if we're actually signing
+    if (newOptions.signTx !== false && !pin) {
       throw new PinRequiredError('Pin is required.');
     }
 
-    // Verify address belongs to wallet and get its index
-    const addressIndex = await this.getAddressIndexIfOwned(address);
+    // Verify address belongs to wallet
+    await this.getAddressIndexIfOwned(address);
 
     // Get the caller address
-    const callerAddress = await this.getCallerAddressFromIndex(pin, addressIndex);
+    const callerAddress = new Address(address, { network: this.getNetworkObject() });
 
     // Build and send transaction
     const actions = data.actions || [];
@@ -2826,9 +3038,21 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       .setArgs(args)
       .setVertexType(NanoContractVertexType.TRANSACTION);
 
+    // Set max fee if declared
+    if (newOptions.maxFee !== undefined) {
+      builder.setMaxFee(newOptions.maxFee);
+    }
+
+    // Set contract pays fees if declared
+    if (newOptions.contractPaysFees !== undefined) {
+      builder.setContractPaysFees(newOptions.contractPaysFees);
+    }
+
     const tx = await builder.build();
     // Use the standard utility to sign and prepare the transaction
-    return this.prepareNanoSendTransactionWalletService(tx, address, pin);
+    return this.prepareNanoSendTransactionWalletService(tx, address, pin!, {
+      signTx: newOptions.signTx,
+    });
   }
 
   /**
@@ -2837,7 +3061,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
    * @param {string} method Method of nano contract to have the transaction created
    * @param {string} address Address that will be used to sign the nano contract transaction
    * @param {CreateNanoTxData} [data]
-   * @param {CreateNanoTxOptions} [options]
+   * @param {Omit<CreateNanoTxOptions, 'signTx'>} [options]
    *
    * @returns {Promise<Transaction>} Transaction object returned from execution
    */
@@ -2845,14 +3069,13 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     method: string,
     address: string,
     data: CreateNanoTxData,
-    options: { pinCode?: string } = {}
+    options: Omit<CreateNanoTxOptions, 'signTx'> = {}
   ): Promise<Transaction> {
-    const sendTransaction = await this.createNanoContractTransaction(
-      method,
-      address,
-      data,
-      options
-    );
+    const sendTransaction = await this.createNanoContractTransaction(method, address, data, {
+      ...options,
+      signTx: true,
+    });
+
     const result = await sendTransaction.runFromMining();
     if (!result) {
       throw new Error('Failed to send nano contract transaction');
@@ -2876,7 +3099,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     address: string,
     data: CreateNanoTxData,
     createTokenOptions: CreateTokenOptionsInput,
-    options: { pinCode?: string } = {}
+    options: CreateNanoTxOptions = {}
   ): Promise<Transaction> {
     const sendTransaction = await this.createNanoContractCreateTokenTransaction(
       method,
@@ -2904,7 +3127,8 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
   async prepareNanoSendTransactionWalletService(
     tx: Transaction,
     address: string,
-    pinCode: string
+    pinCode: string | null,
+    options: { signTx?: boolean } = { signTx: true }
   ): Promise<SendTransactionWalletService> {
     // Get the index for the address
     const addressDetails = await this.getAddressDetails(address);
@@ -2916,12 +3140,9 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       );
     }
 
-    const storageProxy = new WalletServiceStorageProxy(this, this.storage);
-
-    await transaction.signTransaction(tx, storageProxy.createProxy(), pinCode);
-
-    // Finalize the transaction
-    tx.prepareToSend();
+    if (options.signTx !== false && pinCode) {
+      await this.signTx(tx, { pinCode });
+    }
 
     const sendTransaction = new SendTransactionWalletService(this, {
       transaction: tx,
@@ -2946,23 +3167,25 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
     address: string,
     data: CreateNanoTxData,
     createTokenOptions: CreateTokenOptionsInput,
-    options: { pinCode?: string } = {}
+    options: CreateNanoTxOptions = {}
   ): Promise<SendTransactionWalletService> {
     this.failIfWalletNotReady();
     if (await this.storage.isReadonly()) {
       throw new WalletFromXPubGuard('createNanoContractCreateTokenTransaction');
     }
-    const newOptions = { pinCode: null, ...options };
+    const newOptions = { pinCode: null, signTx: true, ...options };
     const pin = newOptions.pinCode;
-    if (!pin) {
+
+    // Only require PIN if we're actually signing
+    if (newOptions.signTx !== false && !pin) {
       throw new PinRequiredError('Pin is required.');
     }
 
-    // Verify address belongs to wallet and get its index
-    const addressIndex = await this.getAddressIndexIfOwned(address);
+    // // Verify address belongs to wallet
+    await this.getAddressIndexIfOwned(address);
 
     // Get the caller address
-    const callerAddress = await this.getCallerAddressFromIndex(pin, addressIndex);
+    const callerAddress = new Address(address, { network: this.getNetworkObject() });
 
     // Build and send transaction
     const actions = data.actions || [];
@@ -2978,6 +3201,7 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       allowExternalMeltAuthorityAddress: false,
       data: null,
       isCreateNFT: false,
+      tokenVersion: TokenVersion.DEPOSIT,
       ...createTokenOptions,
     } as NanoContractBuilderCreateTokenOptions;
 
@@ -2990,6 +3214,16 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
       .setActions(actions)
       .setArgs(args)
       .setVertexType(NanoContractVertexType.CREATE_TOKEN_TRANSACTION, mergedCreateTokenOptions);
+
+    // Set max fee if declared
+    if (newOptions.maxFee !== undefined) {
+      builder.setMaxFee(newOptions.maxFee);
+    }
+
+    // Set contract pays fees if declared
+    if (newOptions.contractPaysFees !== undefined) {
+      builder.setContractPaysFees(newOptions.contractPaysFees);
+    }
 
     const tx = await builder.build();
 
@@ -3007,10 +3241,42 @@ class HathorWalletServiceWallet extends EventEmitter implements IHathorWallet {
    * @memberof HathorWalletServiceWallet
    * @inner
    */
-  async hasTxOutsideFirstAddress(): Promise<boolean> {
-    this.failIfWalletNotReady();
+  async hasTxOutsideFirstAddress(ignoreWalletReady: boolean = false): Promise<boolean> {
+    // If the user is sure the wallet service has already loaded his wallet, he can ignore the check
+    if (!ignoreWalletReady) {
+      // We should fail if the wallet is not ready because the wallet service address load mechanism is
+      // asynchronous, so we will get an empty or partial array of addresses if they are not all loaded.
+      this.failIfWalletNotReady();
+    }
     const data = await walletApi.getHasTxOutsideFirstAddress(this);
     return data.hasTransactions;
+  }
+
+  /**
+   * Sign all inputs of the given transaction.
+   *
+   * @param tx - The transaction to be signed
+   * @param options - Options for signing
+   * @param options.pinCode - PIN to decrypt the private key. Optional but required if not set in this
+   *
+   * @returns The signed transaction
+   */
+  async signTx(tx: Transaction, options: { pinCode?: string | null } = {}): Promise<Transaction> {
+    if (await this.storage.isReadonly()) {
+      throw new WalletFromXPubGuard('signTx');
+    }
+    if (!options.pinCode) {
+      throw new Error('Pin code is required to sign a transaction');
+    }
+
+    const storageProxy = new WalletServiceStorageProxy(this, this.storage);
+    const signedTx = await transaction.signTransaction(
+      tx,
+      storageProxy.createProxy(),
+      options.pinCode
+    );
+    signedTx.prepareToSend(transaction.getWeightConstantsFromStorage(this.storage));
+    return signedTx;
   }
 }
 
